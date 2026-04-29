@@ -78,6 +78,28 @@ async def chain_expiries(currency: str):
     return {"currency": currency, "expiries": adapter.expiries(currency)}
 
 
+@app.get("/api/smile/historic")
+async def smile_historic(currency: str, expiry: str, as_of_ms: int):
+    """One-shot historic SABR fit. Replays mark_iv from each instrument's
+    HistoryStore series, snaps to the closest sample to `as_of_ms` (clamping
+    to the 24h buffer boundary), fits SABR, returns the frozen curve. The
+    frontend calls this once per as-of change and renders the result statically.
+    """
+    adapter: DeribitAdapter = registry.get("deribit")
+    res = adapter.historic_smile_fit(currency, expiry, as_of_ms)
+    return {
+        "currency": currency,
+        "expiry": expiry,
+        "as_of_ms": as_of_ms,
+        "snapped_ms": res.snapped_ms,
+        "earliest_ms": res.earliest_ms,
+        "latest_ms": res.latest_ms,
+        "forward": res.forward,
+        "fit": _fit_dict(res.fit) if res.fit else None,
+        "market_points": [{"strike": k, "iv": v} for k, v in res.market_points],
+    }
+
+
 def _store() -> HistoryStore:
     adapter: DeribitAdapter = registry.get("deribit")
     return adapter.history

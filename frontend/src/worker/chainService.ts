@@ -1,9 +1,13 @@
-// chainService — dual-mode chain snapshot stream.
+// chainService — dual-mode chain snapshot stream + one-shot expiries lookup.
 //
 // Subscriptions are keyed by {currency, expiry?}. The oracle's refcount
 // dedups so multiple tabs/widgets on the same slice share one backend
 // conversation. Server emits a ChainSnapshot envelope every chain poll
 // (~2s); we yield those envelopes verbatim.
+//
+// `fetchExpiries` is one-shot and *also* routed through the oracle (HRT
+// principle 1: tabs never hit FastAPI directly), so duplicate widget mounts
+// share one HTTP fetch via the oracle's refcount.
 
 import { isOracleContext, registerService, subscribeRemote } from './hrtWorker';
 
@@ -53,16 +57,29 @@ if (isOracleContext) {
       }
     }
   });
+
+  // One-shot expiries lookup, routed through the oracle so multiple widget
+  // mounts on the same currency dedup at the oracle refcount.
+  registerService('chainExpiries', async function* (params) {
+    const { currency } = params as { currency: string };
+    const resp = await fetch(`/api/chain/expiries?currency=${encodeURIComponent(currency)}`);
+    if (!resp.ok) throw new Error(`expiries ${currency}: ${resp.status}`);
+    const body = await resp.json();
+    yield (body.expiries ?? []) as string[];
+  });
 }
 
 export function chainStream(currency: string, expiry?: string | null): AsyncGenerator<ChainSnapshot> {
   return subscribeRemote('chain', { currency, expiry: expiry ?? null }) as AsyncGenerator<ChainSnapshot>;
 }
 
-// Lightweight HTTP fallback for the expiry list (small, cheap, refresh on widget mount).
 export async function fetchExpiries(currency: string): Promise<string[]> {
-  const resp = await fetch(`/api/chain/expiries?currency=${encodeURIComponent(currency)}`);
-  if (!resp.ok) throw new Error(`expiries ${currency}: ${resp.status}`);
-  const body = await resp.json();
-  return (body.expiries ?? []) as string[];
+  const gen = subscribeRemote('chainExpiries', { currency }) as AsyncGenerator<string[]>;
+  try {
+    const { value, done } = await gen.next();
+    if (done) throw new Error('chainExpiries yielded no value');
+    return value;
+  } finally {
+    await gen.return(undefined);
+  }
 }

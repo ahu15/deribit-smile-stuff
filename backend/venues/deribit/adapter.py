@@ -3,14 +3,16 @@ import logging
 import time
 from collections import defaultdict
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 
 from backend.backfill import Backfill
 from backend.chain import (
     BookSummary, ChainRow, ChainSnapshot, OptionMark,
     expiry_ms, parse_expiry, parse_option_type, parse_strike,
 )
-from backend.fit import FitResult, fit_smile
-from backend.history import HistoryStore
+from backend.fit import FitResult, average_iv_by_strike, fit_smile
+from backend.history import HistoryStore, Sample
+from backend.iv import iv_from_price
 from backend.ratelimit import RateLimitStatus
 from backend.venues.base import VenueAdapter
 from .auth import load_credentials
@@ -20,8 +22,26 @@ log = logging.getLogger(__name__)
 
 _SUPPORTED_CURRENCIES = ["BTC", "ETH"]
 _POLL_INTERVAL = 2.0  # seconds between book-summary polls
+_MS_PER_YEAR = 365.0 * 86400.0 * 1000.0
 _HOUR_MS = 60 * 60 * 1000
 _DAY_MS = 24 * _HOUR_MS
+
+
+@dataclass
+class HistoricSmileFit:
+    """One-shot SABR fit replayed from `HistoryStore` at a chosen `as_of_ms`.
+
+    `snapped_ms` is the per-instrument-nearest-sample stamp that the fit
+    actually used; outside the 24h buffer it collapses to the boundary.
+    `earliest_ms` / `latest_ms` describe the window the caller can pick
+    from for the requested expiry — used by the UI to surface "no data".
+    """
+    fit: FitResult | None = None
+    market_points: list[tuple[float, float]] = field(default_factory=list)
+    snapped_ms: int | None = None
+    earliest_ms: int | None = None
+    latest_ms: int | None = None
+    forward: float | None = None
 
 
 class DeribitAdapter(VenueAdapter):
@@ -145,16 +165,7 @@ class DeribitAdapter(VenueAdapter):
             except ValueError:
                 pass
 
-    async def refresh_book_summaries(self, currency: str) -> list[BookSummary]:
-        summaries = await self._rest.get_book_summary_by_currency(currency)
-        self._merge(currency, summaries)
-        snap = self._snapshots.get(currency)
-        return list(snap.book_summaries.values()) if snap else []
-
     # ---------- M3 chain & smile views ----------
-
-    def latest_snapshot(self, currency: str) -> ChainSnapshot | None:
-        return self._snapshots.get(currency)
 
     def expiries(self, currency: str) -> list[str]:
         snap = self._snapshots.get(currency)
@@ -179,14 +190,37 @@ class DeribitAdapter(VenueAdapter):
             mid = 0.5 * (bid + ask) if (bid is not None and ask is not None) else None
             spread = (ask - bid) if (bid is not None and ask is not None) else None
 
+            # Deribit's get_book_summary_by_currency doesn't return bid_iv /
+            # ask_iv for options, so book.* is None in practice. Invert the
+            # coin-denominated quote to a vol via BS (forward = mark.underlying_price,
+            # which is per-expiry on Deribit), seeded from mark_iv so Newton
+            # converges in a couple of iterations.
+            bid_iv = book.bid_iv if book else None
+            ask_iv = book.ask_iv if book else None
+            if (bid_iv is None or ask_iv is None) and mark.mark_iv > 0:
+                ex_ms = expiry_ms(inst_expiry)
+                if ex_ms is not None:
+                    t_years = (ex_ms - mark.timestamp_ms) / _MS_PER_YEAR
+                    is_call = (opt_type == "C")
+                    if bid_iv is None and bid is not None and bid > 0:
+                        bid_iv = iv_from_price(
+                            bid, mark.underlying_price, strike, t_years,
+                            is_call=is_call, iv_guess=mark.mark_iv,
+                        )
+                    if ask_iv is None and ask is not None and ask > 0:
+                        ask_iv = iv_from_price(
+                            ask, mark.underlying_price, strike, t_years,
+                            is_call=is_call, iv_guess=mark.mark_iv,
+                        )
+
             rows.append(ChainRow(
                 instrument_name=name,
                 expiry=inst_expiry,
                 strike=strike,
                 option_type=opt_type,
                 mark_iv=mark.mark_iv,
-                bid_iv=book.bid_iv if book else None,
-                ask_iv=book.ask_iv if book else None,
+                bid_iv=bid_iv,
+                ask_iv=ask_iv,
                 mark_price=mark.mark_price,
                 bid_price=bid,
                 ask_price=ask,
@@ -213,30 +247,111 @@ class DeribitAdapter(VenueAdapter):
         if not snap:
             return None
         forward = 0.0
-        # Per-strike: prefer the side with non-zero IV. If both have IV, average.
-        by_strike: dict[float, list[float]] = defaultdict(list)
+        pairs: list[tuple[float, float]] = []
         for name, mark in snap.marks.items():
             if parse_expiry(name) != expiry:
                 continue
             strike = parse_strike(name)
-            if strike is None or mark.mark_iv <= 0:
+            if strike is None:
                 continue
-            by_strike[strike].append(mark.mark_iv)
+            pairs.append((strike, mark.mark_iv))
             if mark.underlying_price > 0:
                 forward = mark.underlying_price
-        if forward <= 0 or not by_strike:
+        strikes, ivs = average_iv_by_strike(pairs)
+        if forward <= 0 or not strikes:
             return None
 
         ex_ms = expiry_ms(expiry)
         if ex_ms is None:
             return None
-        t_years = (ex_ms - snap.timestamp_ms) / (365.0 * 86400.0 * 1000.0)
+        t_years = (ex_ms - snap.timestamp_ms) / _MS_PER_YEAR
         if t_years <= 0:
             return None
-
-        strikes = sorted(by_strike.keys())
-        ivs = [sum(by_strike[k]) / len(by_strike[k]) for k in strikes]
         return fit_smile(forward, t_years, strikes, ivs, beta=1.0)
+
+    def historic_smile_fit(
+        self, currency: str, expiry: str, as_of_ms: int,
+    ) -> HistoricSmileFit:
+        """One-shot SABR fit from each instrument's closest mark_iv sample to
+        `as_of_ms`. Frozen reference curve for the smile chart's "compare-to"
+        overlay — outside the 24h buffer the snap collapses to the boundary
+        so the user always gets *some* curve back.
+        """
+        snap = self._snapshots.get(currency)
+        if not snap:
+            return HistoricSmileFit()
+
+        # Walk the expiry's universe once: capture the available window for
+        # the UI's "data range" hint *and* the per-strike samples we'll snap.
+        earliest_ms: int | None = None
+        latest_ms: int | None = None
+        per_inst_samples: list[tuple[float, list[Sample]]] = []
+        for name in snap.marks:
+            if parse_expiry(name) != expiry:
+                continue
+            strike = parse_strike(name)
+            if strike is None:
+                continue
+            samples = self.history.series(name, "mark_iv")
+            if not samples:
+                continue
+            if earliest_ms is None or samples[0].ts_ms < earliest_ms:
+                earliest_ms = samples[0].ts_ms
+            if latest_ms is None or samples[-1].ts_ms > latest_ms:
+                latest_ms = samples[-1].ts_ms
+            per_inst_samples.append((strike, samples))
+
+        result = HistoricSmileFit(earliest_ms=earliest_ms, latest_ms=latest_ms)
+        if not per_inst_samples:
+            return result
+
+        # Snap each instrument to its sample closest to `as_of_ms` (not
+        # strictly at-or-before): outside the 24h window we clamp to a
+        # boundary; inside it we tolerate sparse samples.
+        pairs: list[tuple[float, float]] = []
+        snapped_ms: int | None = None
+        for strike, samples in per_inst_samples:
+            best = min(samples, key=lambda s: abs(s.ts_ms - as_of_ms))
+            pairs.append((strike, best.value))
+            if snapped_ms is None or abs(best.ts_ms - as_of_ms) < abs(snapped_ms - as_of_ms):
+                snapped_ms = best.ts_ms
+
+        strikes, ivs = average_iv_by_strike(pairs)
+        if not strikes or snapped_ms is None:
+            return result
+
+        # Forward at the snapped timestamp from the option-implied series.
+        # Fall back to the latest snapshot's value if this expiry has no
+        # forward history yet — order-of-magnitude correct for plotting.
+        forward = self._forward_at(currency, expiry, snapped_ms)
+        if forward is None or forward <= 0:
+            return result
+
+        ex_ms = expiry_ms(expiry)
+        if ex_ms is None:
+            return result
+        t_years = (ex_ms - snapped_ms) / _MS_PER_YEAR
+        if t_years <= 0:
+            return result
+
+        result.fit = fit_smile(forward, t_years, strikes, ivs, beta=1.0)
+        result.market_points = list(zip(strikes, ivs))
+        result.snapped_ms = snapped_ms
+        result.forward = forward
+        return result
+
+    def _forward_at(self, currency: str, expiry: str, ts_ms: int) -> float | None:
+        fwd_samples = self.history.aggregate(currency, f"forward_opt:{expiry}")
+        if fwd_samples:
+            best = min(fwd_samples, key=lambda s: abs(s.ts_ms - ts_ms))
+            if best.value > 0:
+                return best.value
+        snap = self._snapshots.get(currency)
+        if snap:
+            for mark in snap.marks.values():
+                if parse_expiry(mark.instrument_name) == expiry and mark.underlying_price > 0:
+                    return mark.underlying_price
+        return None
 
     async def ping_deribit(self) -> dict:
         """Round-trip ping that hits Deribit — for end-to-end pingService test."""

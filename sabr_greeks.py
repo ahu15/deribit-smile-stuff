@@ -291,7 +291,7 @@ class BSMerton:
             b = self.vega()
             c = -diff
             D_sigma = (-b + (b**2 - 4*a*c)**0.5)/(2*a)
-            
+
 
             self.sigma = self.sigma - (D_sigma/100)
             self.sigmaT = self.sigma * self.T ** 0.5

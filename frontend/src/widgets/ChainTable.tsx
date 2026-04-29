@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { registerWidget, type WidgetProps } from '../shell/widgetRegistry';
 import { chainStream, fetchExpiries, type ChainRow, type ChainSnapshot } from '../worker/chainService';
+import { pickClosestExpiry, sortExpiries } from '../shared/expiry';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Visual spec — Option Chain Visual Spec.md
@@ -305,44 +306,6 @@ function bps(r: ChainRow | null): number | null {
   return (r.spread / r.mid_price) * 10000;
 }
 
-const MONTHS: Record<string, number> = {
-  JAN: 0, FEB: 1, MAR: 2, APR: 3, MAY: 4, JUN: 5,
-  JUL: 6, AUG: 7, SEP: 8, OCT: 9, NOV: 10, DEC: 11,
-};
-
-// Parse a Deribit expiry token ("26APR26", "8MAY26") to a UTC ms timestamp at
-// 08:00 UTC (Deribit's options settlement time). Used purely for ordering the
-// expiry dropdown — backend treats the token as opaque elsewhere.
-function parseExpiryMs(token: string): number | null {
-  const m = /^(\d{1,2})([A-Z]{3})(\d{2})$/.exec(token);
-  if (!m) return null;
-  const day = Number(m[1]);
-  const mon = MONTHS[m[2]];
-  if (mon == null) return null;
-  const year = 2000 + Number(m[3]);
-  return Date.UTC(year, mon, day, 8, 0, 0);
-}
-
-// Resolve a saved expiry against the currently-listed expiries. If the token
-// is null or no longer in the list (rolled off since the profile was saved),
-// return the chronologically nearest remaining expiry — keeps the rest of the
-// widget settings untouched while still giving the user *some* chain to read.
-function pickClosestExpiry(saved: string | null | undefined, list: string[]): string | null {
-  if (list.length === 0) return null;
-  if (!saved) return list[0];
-  const savedMs = parseExpiryMs(saved);
-  if (savedMs == null) return list[0];
-  let best = list[0];
-  let bestDiff = Infinity;
-  for (const e of list) {
-    const ms = parseExpiryMs(e);
-    if (ms == null) continue;
-    const diff = Math.abs(ms - savedMs);
-    if (diff < bestDiff) { bestDiff = diff; best = e; }
-  }
-  return best;
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Pair calls + puts at each strike. Output is sorted by strike ascending.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -414,12 +377,10 @@ function ChainTable({ config, onConfigChange }: WidgetProps<ChainTableConfig>) {
     return () => ctrl.abort();
   }, [config.symbol, config.expiry]);
 
-  const expiries = useMemo(() => {
-    const set = new Set<string>([...(snap?.expiries ?? []), ...expiriesFromHttp]);
-    // Sort by actual expiry date (nearest first), not lexicographic, so the
-    // dropdown reads chronologically. Unparseable tokens fall to the end.
-    return [...set].sort((a, b) => (parseExpiryMs(a) ?? Infinity) - (parseExpiryMs(b) ?? Infinity));
-  }, [snap?.expiries, expiriesFromHttp]);
+  const expiries = useMemo(
+    () => sortExpiries(new Set<string>([...(snap?.expiries ?? []), ...expiriesFromHttp])),
+    [snap?.expiries, expiriesFromHttp],
+  );
 
   const visibleMetrics = useMemo(
     () => config.metrics.map(id => METRIC_DEFS[id]).filter(Boolean),

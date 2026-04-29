@@ -7,11 +7,30 @@ inputs/outputs use decimal vols (e.g. 0.85 = 85%).
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
+from typing import Iterable
 
 import numpy as np
 
 from sabr_greeks import SABR
+
+
+def average_iv_by_strike(pairs: Iterable[tuple[float, float]]) -> tuple[list[float], list[float]]:
+    """Collapse (strike, iv) pairs into ascending-strike + per-strike-mean lists.
+
+    Deribit options are call/put pairs at the same strike whose mark IVs are
+    parity-quoted, so combining them just denoises. Drops zeros / non-finite /
+    None inputs the caller didn't pre-filter.
+    """
+    by_strike: dict[float, list[float]] = defaultdict(list)
+    for k, v in pairs:
+        if k is None or v is None or not np.isfinite(v) or v <= 0:
+            continue
+        by_strike[k].append(v)
+    strikes = sorted(by_strike.keys())
+    ivs = [sum(by_strike[k]) / len(by_strike[k]) for k in strikes]
+    return strikes, ivs
 
 
 @dataclass

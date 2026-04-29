@@ -27,19 +27,10 @@ class BookSummary:
 
 
 @dataclass
-class ForwardPrice:
-    instrument_name: str
-    mark_price: float
-    underlying_price: float
-    timestamp_ms: int
-
-
-@dataclass
 class ChainSnapshot:
     currency: str
     timestamp_ms: int
     marks: dict[str, OptionMark] = field(default_factory=dict)
-    forwards: dict[str, ForwardPrice] = field(default_factory=dict)
     book_summaries: dict[str, BookSummary] = field(default_factory=dict)
 
     def expiries(self) -> list[str]:

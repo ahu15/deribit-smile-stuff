@@ -21,6 +21,11 @@ let backendReady: Promise<void> = new Promise(() => {});
 let resolveReady: (() => void) | null = null;
 const backendListeners = new Set<(env: BackendEnvelope) => void>();
 const pendingPings = new Map<string, (env: BackendEnvelope) => void>();
+// Active backend conversations — needed so we can re-send their subscribe
+// messages whenever the WS reconnects (e.g. after a backend restart). Without
+// this, every open chain/smile/history stream silently hangs forever after the
+// reconnect because the new socket has no record of the old subscription.
+const activeConversations = new Map<string, { type: string } & Record<string, unknown>>();
 
 function connectBackend() {
   backendWs = new WebSocket(BACKEND_WS);
@@ -31,6 +36,16 @@ function connectBackend() {
   backendWs.onopen = () => {
     resolveReady?.();
     broadcastSystem({ type: 'backend_connected' });
+    // Replay every still-open conversation. Each `backendConversation` keeps
+    // its conversationId stable for its lifetime, so the consumer's queue
+    // and listener don't need to be rewired — just re-arm the backend side.
+    for (const [conversationId, msg] of activeConversations) {
+      try {
+        backendWs!.send(JSON.stringify({ ...msg, conversationId }));
+      } catch {
+        // The next reconnect cycle will retry; nothing else to do here.
+      }
+    }
   };
 
   backendWs.onmessage = (evt: MessageEvent<string>) => {
@@ -116,6 +131,9 @@ export async function* backendConversation(
   };
   backendListeners.add(fn);
 
+  // Record before sending so a reconnect that fires between send + receipt
+  // will replay this conversation rather than skip it.
+  activeConversations.set(conversationId, subscribeMsg);
   backendWs.send(JSON.stringify({ ...subscribeMsg, conversationId }));
 
   try {
@@ -125,6 +143,7 @@ export async function* backendConversation(
     }
   } finally {
     backendListeners.delete(fn);
+    activeConversations.delete(conversationId);
     if (backendWs?.readyState === WebSocket.OPEN) {
       backendWs.send(JSON.stringify({ type: 'unsubscribe', conversationId }));
     }
