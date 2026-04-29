@@ -43,9 +43,15 @@ export function getService(name: string): ServiceFactory | undefined {
 // upstream AsyncGenerator and fan out to both subscribers. Drops when the
 // last subscriber goes away.
 
+export interface StreamHandlers {
+  onPayload: (payload: unknown) => void;
+  onError?: (message: string) => void;
+  onComplete?: () => void;
+}
+
 interface SharedStream {
   refcount: number;
-  subscribers: Set<(payload: unknown) => void>;
+  subscribers: Set<StreamHandlers>;
   abort: AbortController;
 }
 
@@ -59,13 +65,13 @@ export function acquireSharedStream(
   service: string,
   params: unknown,
   factory: ServiceFactory,
-  onPayload: (payload: unknown) => void,
+  handlers: StreamHandlers,
 ): () => void {
   const key = paramsKey(service, params);
   let entry = _shared.get(key);
   if (!entry) {
     const abort = new AbortController();
-    const subscribers = new Set<(payload: unknown) => void>();
+    const subscribers = new Set<StreamHandlers>();
     entry = { refcount: 0, subscribers, abort };
     _shared.set(key, entry);
 
@@ -73,22 +79,24 @@ export function acquireSharedStream(
       try {
         for await (const item of factory(params)) {
           if (abort.signal.aborted) break;
-          for (const fn of subscribers) fn(item);
+          for (const sub of subscribers) sub.onPayload(item);
         }
-      } catch {
-        // upstream errored — let subscribers retry on demand
+        for (const sub of subscribers) sub.onComplete?.();
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        for (const sub of subscribers) sub.onError?.(message);
       } finally {
         _shared.delete(key);
       }
     })();
   }
   entry.refcount++;
-  entry.subscribers.add(onPayload);
+  entry.subscribers.add(handlers);
 
   return () => {
     const e = _shared.get(key);
     if (!e) return;
-    e.subscribers.delete(onPayload);
+    e.subscribers.delete(handlers);
     e.refcount--;
     if (e.refcount <= 0) {
       e.abort.abort();

@@ -9,6 +9,7 @@ import { acquireSharedStream } from './hrtWorker';
 import './pingService';
 import './chainService';
 import './rateLimitService';
+import './historyService';
 
 const BACKEND_WS = 'ws://localhost:8000/ws/oracle';
 
@@ -86,6 +87,48 @@ export function backendStream(typeFilter: string): AsyncGenerator<unknown> {
 }
 
 let _pingId = 0;
+let _convCounter = 0;
+
+/** Open a backend-side conversation. Sends the subscribe message tagged with a
+ *  generated `conversationId`, yields every backend envelope tagged with that id,
+ *  and on cancellation sends `{type:'unsubscribe', conversationId}`.
+ *
+ *  Used by per-instrument history/trades streams; the chain and rate-limit
+ *  envelopes remain broadcast (no conversationId) and use `backendStream` instead.
+ */
+export async function* backendConversation(
+  subscribeMsg: { type: string } & Record<string, unknown>,
+): AsyncGenerator<BackendEnvelope> {
+  await backendReady;
+  if (!backendWs) throw new Error('backend not connected');
+
+  const conversationId = `bk-${++_convCounter}-${Date.now()}`;
+  const queue: BackendEnvelope[] = [];
+  let notify: (() => void) | null = null;
+
+  const fn = (env: BackendEnvelope) => {
+    if (env.conversationId === conversationId) {
+      queue.push(env);
+      notify?.();
+      notify = null;
+    }
+  };
+  backendListeners.add(fn);
+
+  backendWs.send(JSON.stringify({ ...subscribeMsg, conversationId }));
+
+  try {
+    while (true) {
+      if (queue.length > 0) yield queue.shift()!;
+      else await new Promise<void>((res) => { notify = res; });
+    }
+  } finally {
+    backendListeners.delete(fn);
+    if (backendWs?.readyState === WebSocket.OPEN) {
+      backendWs.send(JSON.stringify({ type: 'unsubscribe', conversationId }));
+    }
+  }
+}
 
 export async function backendPing(payload?: unknown): Promise<BackendEnvelope> {
   await backendReady;
@@ -130,10 +173,11 @@ async function handleSubscribe(port: MessagePort, msg: ClientToOracle & { type: 
     return;
   }
 
-  const onPayload = (payload: unknown) => {
-    send(port, { conversationId: msg.conversationId, type: 'data', payload });
-  };
-  const release = acquireSharedStream(msg.service, msg.params, factory, onPayload);
+  const release = acquireSharedStream(msg.service, msg.params, factory, {
+    onPayload: (payload) => send(port, { conversationId: msg.conversationId, type: 'data', payload }),
+    onError: (message) => send(port, { conversationId: msg.conversationId, type: 'error', message }),
+    onComplete: () => send(port, { conversationId: msg.conversationId, type: 'complete' }),
+  });
 
   subs.set(msg.conversationId, { port, conversationId: msg.conversationId, release });
 }

@@ -42,7 +42,21 @@ class ChainSnapshot:
     def expiries(self) -> list[str]:
         seen: set[str] = set()
         for name in self.marks:
-            parts = name.split("-")
-            if len(parts) >= 3:
-                seen.add(parts[1])
+            exp = parse_expiry(name)
+            if exp:
+                seen.add(exp)
         return sorted(seen)
+
+
+def parse_expiry(instrument_name: str) -> str | None:
+    """Deribit instrument naming: `{CCY}-{EXPIRY}-{STRIKE}-{C|P}` for options,
+    `{CCY}-{EXPIRY}` for dated futures, `{CCY}-PERPETUAL` for perpetuals.
+    Returns the EXPIRY token (e.g. "26APR26") or None for perpetuals / malformed names.
+    """
+    parts = instrument_name.split("-")
+    if len(parts) < 2:
+        return None
+    expiry = parts[1]
+    if expiry == "PERPETUAL":
+        return None
+    return expiry

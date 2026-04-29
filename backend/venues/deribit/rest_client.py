@@ -23,8 +23,10 @@ _ENDPOINT_COSTS: dict[str, float] = {
     "public/get_book_summary_by_currency": 2.0,
     "public/get_last_trades_by_instrument_and_time": 2.0,
     "public/get_last_trades_by_currency": 2.0,
+    "public/get_last_trades_by_currency_and_time": 2.0,
     "public/get_tradingview_chart_data": 2.0,
     "public/get_volatility_index_data": 1.0,
+    "public/get_instruments": 1.0,
 }
 
 
@@ -112,6 +114,94 @@ class DeribitRestClient:
             priority=PriorityRestQueue.PRIORITY_BACKFILL,
         )
         return (result or {}).get("trades", [])
+
+    async def get_last_trades_by_currency(
+        self,
+        currency: str,
+        start_timestamp: int,
+        end_timestamp: int,
+        kind: str = "option",
+        count: int = 1000,
+    ) -> list[dict]:
+        """One call returns trades across every instrument of `kind` for `currency`.
+
+        We page by walking `start_seq` backwards until we either pass
+        `start_timestamp` or run out — Deribit returns trades newest-first.
+        """
+        all_trades: list[dict] = []
+        cursor_end = end_timestamp
+        for _ in range(20):  # hard ceiling — 20 * 1000 = 20k trades / ccy / 24h is plenty
+            result = await self._get(
+                "public/get_last_trades_by_currency_and_time",
+                {
+                    "currency": currency,
+                    "kind": kind,
+                    "start_timestamp": start_timestamp,
+                    "end_timestamp": cursor_end,
+                    "count": count,
+                    "include_old": True,
+                },
+                priority=PriorityRestQueue.PRIORITY_BACKFILL,
+            )
+            page = (result or {}).get("trades", [])
+            if not page:
+                break
+            all_trades.extend(page)
+            if not (result or {}).get("has_more"):
+                break
+            # Continue from just before the oldest trade in this page.
+            oldest_ts = min(t.get("timestamp", cursor_end) for t in page)
+            if oldest_ts <= start_timestamp:
+                break
+            cursor_end = oldest_ts - 1
+        return all_trades
+
+    async def get_tradingview_chart_data(
+        self,
+        instrument_name: str,
+        start_timestamp: int,
+        end_timestamp: int,
+        resolution: str = "1",
+    ) -> dict:
+        """OHLCV bars. `resolution` is minutes ("1", "5", ...) or "1D"."""
+        result = await self._get(
+            "public/get_tradingview_chart_data",
+            {
+                "instrument_name": instrument_name,
+                "start_timestamp": start_timestamp,
+                "end_timestamp": end_timestamp,
+                "resolution": resolution,
+            },
+            priority=PriorityRestQueue.PRIORITY_BACKFILL,
+        )
+        return result or {}
+
+    async def get_volatility_index_data(
+        self,
+        currency: str,
+        start_timestamp: int,
+        end_timestamp: int,
+        resolution: str = "60",
+    ) -> dict:
+        """DVOL series. `resolution` is in seconds (e.g. "60" = 1-min bars)."""
+        result = await self._get(
+            "public/get_volatility_index_data",
+            {
+                "currency": currency,
+                "start_timestamp": start_timestamp,
+                "end_timestamp": end_timestamp,
+                "resolution": resolution,
+            },
+            priority=PriorityRestQueue.PRIORITY_BACKFILL,
+        )
+        return result or {}
+
+    async def get_instruments(self, currency: str, kind: str | None = None) -> list[dict]:
+        params: dict[str, Any] = {"currency": currency, "expired": False}
+        if kind:
+            params["kind"] = kind
+        result = await self._get("public/get_instruments", params)
+        return result or []
 
     @property
     def rate_limit_status(self) -> RateLimitStatus:

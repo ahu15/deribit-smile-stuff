@@ -20,4 +20,6 @@ export interface BackendEnvelope {
   data?: unknown;
   id?: string | number;
   error?: string;
+  // Set on conversation-scoped envelopes (history/trades subscriptions).
+  conversationId?: string;
 }

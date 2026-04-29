@@ -4,7 +4,9 @@ import time
 from collections import defaultdict
 from collections.abc import AsyncIterator
 
-from backend.chain import BookSummary, ChainSnapshot, OptionMark
+from backend.backfill import Backfill
+from backend.chain import BookSummary, ChainSnapshot, OptionMark, parse_expiry
+from backend.history import HistoryStore
 from backend.ratelimit import RateLimitStatus
 from backend.venues.base import VenueAdapter
 from .auth import load_credentials
@@ -23,12 +25,16 @@ class DeribitAdapter(VenueAdapter):
         self._mark_queues: dict[str, list[asyncio.Queue]] = defaultdict(list)
         self._snapshots: dict[str, ChainSnapshot] = {}
         self._tasks: list[asyncio.Task] = []
+        self.history = HistoryStore()
+        self.backfill = Backfill(self._rest, self.history, _SUPPORTED_CURRENCIES)
 
     async def start(self) -> None:
         await self._rest.start()
         for ccy in _SUPPORTED_CURRENCIES:
             self._tasks.append(asyncio.create_task(self._poll_loop(ccy)))
-        log.info("DeribitAdapter started — REST polling @ %.0fs", _POLL_INTERVAL)
+        # Backfill runs at PRIORITY_BACKFILL — live polling preempts via the queue.
+        self._tasks.append(asyncio.create_task(self.backfill.run()))
+        log.info("DeribitAdapter started — REST polling @ %.0fs + backfill", _POLL_INTERVAL)
 
     async def stop(self) -> None:
         for t in self._tasks:
@@ -55,30 +61,61 @@ class DeribitAdapter(VenueAdapter):
             currency, ChainSnapshot(currency=currency, timestamp_ms=ts)
         )
         snap.timestamp_ms = ts
+        # Per-expiry option-implied forward — every option carries its expiry's
+        # forward in `underlying_price`. One value per expiry per snapshot;
+        # written out once at the end of the loop to avoid 50× redundant appends.
+        forward_opt_by_expiry: dict[str, float] = {}
         for s in summaries:
             name = s.get("instrument_name", "")
             if not name:
                 continue
             # book_summary IV is quoted in percent — normalise to decimal.
-            mark_iv_pct = s.get("mark_iv") or 0.0
+            mark_iv = (s.get("mark_iv") or 0.0) / 100.0
+            mark_price = s.get("mark_price") or 0.0
+            bid_price = s.get("bid_price")
+            ask_price = s.get("ask_price")
+            bid_iv = (s["bid_iv"] / 100.0) if s.get("bid_iv") is not None else None
+            ask_iv = (s["ask_iv"] / 100.0) if s.get("ask_iv") is not None else None
+            underlying = s.get("underlying_price") or 0.0
+
+            expiry = parse_expiry(name)
+            if expiry and underlying and expiry not in forward_opt_by_expiry:
+                forward_opt_by_expiry[expiry] = underlying
+
             snap.marks[name] = OptionMark(
                 instrument_name=name,
-                mark_iv=mark_iv_pct / 100.0,
-                mark_price=s.get("mark_price") or 0.0,
-                underlying_price=s.get("underlying_price") or 0.0,
+                mark_iv=mark_iv,
+                mark_price=mark_price,
+                underlying_price=underlying,
                 timestamp_ms=ts,
             )
             snap.book_summaries[name] = BookSummary(
                 instrument_name=name,
-                bid_iv=(s["bid_iv"] / 100.0) if s.get("bid_iv") is not None else None,
-                ask_iv=(s["ask_iv"] / 100.0) if s.get("ask_iv") is not None else None,
-                bid_price=s.get("bid_price"),
-                ask_price=s.get("ask_price"),
+                bid_iv=bid_iv,
+                ask_iv=ask_iv,
+                bid_price=bid_price,
+                ask_price=ask_price,
                 open_interest=s.get("open_interest") or 0.0,
                 volume_24h=s.get("volume") or 0.0,
-                underlying_price=s.get("underlying_price") or 0.0,
+                underlying_price=underlying,
                 timestamp_ms=ts,
             )
+
+            # Live append into the M2.5 store — same source of truth for the live UI
+            # and for any "vs N hours ago" / session-high-low computation.
+            self.history.append_series(name, "mark", ts, mark_price)
+            self.history.append_series(name, "mark_iv", ts, mark_iv)
+            if bid_price is not None:
+                self.history.append_series(name, "bid_price", ts, bid_price)
+            if ask_price is not None:
+                self.history.append_series(name, "ask_price", ts, ask_price)
+            if bid_price is not None and ask_price is not None:
+                mid = 0.5 * (bid_price + ask_price)
+                self.history.append_series(name, "mid", ts, mid)
+                self.history.append_series(name, "spread", ts, ask_price - bid_price)
+
+        for expiry, fwd in forward_opt_by_expiry.items():
+            self.history.append_aggregate(currency, f"forward_opt:{expiry}", ts, fwd)
 
     def _emit(self, currency: str, snap: ChainSnapshot) -> None:
         for q in list(self._mark_queues[currency]):
