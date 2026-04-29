@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 
 @dataclass
@@ -45,7 +48,34 @@ class ChainSnapshot:
             exp = parse_expiry(name)
             if exp:
                 seen.add(exp)
-        return sorted(seen)
+        return sorted(seen, key=lambda e: expiry_ms(e) or 0)
+
+
+@dataclass
+class ChainRow:
+    """Flat per-instrument row for the ChainTable widget. All vols are decimal,
+    prices are coin-denominated (Deribit native), changes come from the M2.5
+    HistoryStore (None until enough history exists).
+    """
+    instrument_name: str
+    expiry: str
+    strike: float
+    option_type: str          # "C" | "P"
+    mark_iv: float
+    bid_iv: float | None
+    ask_iv: float | None
+    mark_price: float
+    bid_price: float | None
+    ask_price: float | None
+    mid_price: float | None
+    spread: float | None
+    open_interest: float
+    volume_24h: float
+    underlying_price: float
+    change_1h: float | None       # absolute change in mark_price vs ~1h ago
+    change_24h: float | None
+    change_iv_1h: float | None    # absolute change in mark_iv vs ~1h ago, decimal
+    timestamp_ms: int
 
 
 def parse_expiry(instrument_name: str) -> str | None:
@@ -60,3 +90,35 @@ def parse_expiry(instrument_name: str) -> str | None:
     if expiry == "PERPETUAL":
         return None
     return expiry
+
+
+def parse_strike(instrument_name: str) -> float | None:
+    parts = instrument_name.split("-")
+    if len(parts) < 4:
+        return None
+    try:
+        return float(parts[2])
+    except ValueError:
+        return None
+
+
+def parse_option_type(instrument_name: str) -> str | None:
+    parts = instrument_name.split("-")
+    if len(parts) < 4:
+        return None
+    t = parts[3].upper()
+    return t if t in ("C", "P") else None
+
+
+def expiry_ms(expiry_token: str) -> int | None:
+    """Deribit options expire at 08:00 UTC on the expiry date. Returns the
+    expiry epoch in milliseconds, or None if `expiry_token` doesn't parse.
+    """
+    if not expiry_token or expiry_token == "PERPETUAL":
+        return None
+    try:
+        dt = datetime.strptime(expiry_token, "%d%b%y")
+    except ValueError:
+        return None
+    dt = dt.replace(hour=8, minute=0, second=0, tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)

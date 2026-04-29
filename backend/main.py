@@ -2,7 +2,6 @@ import asyncio
 import dataclasses
 import json
 import logging
-import time
 from contextlib import asynccontextmanager
 from typing import Callable
 
@@ -15,6 +14,8 @@ load_dotenv()
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 
+from backend.chain import ChainRow
+from backend.fit import FitResult
 from backend.history import HistoryStore, Sample, TradePrint
 from backend.venues.deribit.adapter import DeribitAdapter
 from backend.venues import registry
@@ -71,6 +72,12 @@ async def history_range(instrument: str, field: str, t0_ms: int, t1_ms: int):
     return {"samples": [_sample_dict(s) for s in store.range(instrument, field, t0_ms, t1_ms)]}
 
 
+@app.get("/api/chain/expiries")
+async def chain_expiries(currency: str):
+    adapter: DeribitAdapter = registry.get("deribit")
+    return {"currency": currency, "expiries": adapter.expiries(currency)}
+
+
 def _store() -> HistoryStore:
     adapter: DeribitAdapter = registry.get("deribit")
     return adapter.history
@@ -100,10 +107,8 @@ async def oracle_ws(websocket: WebSocket):
     await websocket.accept()
     log.info("oracle client connected")
 
-    currency = "BTC"
     adapter: DeribitAdapter = registry.get("deribit")
 
-    chain_task = asyncio.create_task(_stream_chain(websocket, adapter, currency))
     status_task = asyncio.create_task(_stream_rate_limit(websocket, adapter))
     backfill_task = asyncio.create_task(_stream_backfill_progress(websocket, adapter))
 
@@ -123,13 +128,6 @@ async def oracle_ws(websocket: WebSocket):
             if mtype == "ping":
                 await _handle_ping(websocket, adapter, msg)
 
-            elif mtype == "subscribe_currency":
-                new_ccy = msg.get("currency", "BTC")
-                if new_ccy != currency:
-                    currency = new_ccy
-                    chain_task.cancel()
-                    chain_task = asyncio.create_task(_stream_chain(websocket, adapter, currency))
-
             elif mtype == "subscribe_history":
                 conv = str(msg.get("conversationId") or "")
                 if conv:
@@ -145,6 +143,16 @@ async def oracle_ws(websocket: WebSocket):
                 if conv:
                     subs[conv] = await _subscribe_trades(websocket, adapter, msg, conv)
 
+            elif mtype == "subscribe_chain":
+                conv = str(msg.get("conversationId") or "")
+                if conv:
+                    subs[conv] = await _subscribe_chain(websocket, adapter, msg, conv)
+
+            elif mtype == "subscribe_smile":
+                conv = str(msg.get("conversationId") or "")
+                if conv:
+                    subs[conv] = await _subscribe_smile(websocket, adapter, msg, conv)
+
             elif mtype == "unsubscribe":
                 conv = str(msg.get("conversationId") or "")
                 cancel = subs.pop(conv, None)
@@ -158,7 +166,6 @@ async def oracle_ws(websocket: WebSocket):
     finally:
         for cancel in subs.values():
             cancel()
-        chain_task.cancel()
         status_task.cancel()
         backfill_task.cancel()
 
@@ -340,33 +347,119 @@ async def _subscribe_trades(
     return cancel
 
 
-# ---------- streams (broadcast envelopes) ----------
+# ---------- chain & smile conversations + serializers ----------
 
 
-async def _stream_chain(ws: WebSocket, adapter: DeribitAdapter, currency: str) -> None:
-    try:
-        async for snap in adapter.chain_stream(currency):
-            payload = {
-                "type": "chain_snapshot",
-                "data": {
-                    "currency": snap.currency,
-                    "timestamp_ms": snap.timestamp_ms,
-                    "mark_count": len(snap.marks),
-                    "marks": {
-                        k: {
-                            "mark_iv": v.mark_iv,
-                            "mark_price": v.mark_price,
-                            "underlying_price": v.underlying_price,
-                        }
-                        for k, v in list(snap.marks.items())[:100]
+def _row_dict(r: ChainRow) -> dict:
+    return {
+        "instrument_name": r.instrument_name,
+        "expiry": r.expiry,
+        "strike": r.strike,
+        "option_type": r.option_type,
+        "mark_iv": r.mark_iv,
+        "bid_iv": r.bid_iv,
+        "ask_iv": r.ask_iv,
+        "mark_price": r.mark_price,
+        "bid_price": r.bid_price,
+        "ask_price": r.ask_price,
+        "mid_price": r.mid_price,
+        "spread": r.spread,
+        "open_interest": r.open_interest,
+        "volume_24h": r.volume_24h,
+        "underlying_price": r.underlying_price,
+        "change_1h": r.change_1h,
+        "change_24h": r.change_24h,
+        "change_iv_1h": r.change_iv_1h,
+        "timestamp_ms": r.timestamp_ms,
+    }
+
+
+def _fit_dict(fit: FitResult) -> dict:
+    return {
+        "alpha": fit.alpha,
+        "rho": fit.rho,
+        "volvol": fit.volvol,
+        "beta": fit.beta,
+        "forward": fit.forward,
+        "t_years": fit.t_years,
+        "strikes": fit.strikes,
+        "fitted_iv": fit.fitted_iv,
+        "market_strikes": fit.market_strikes,
+        "market_iv": fit.market_iv,
+        "residual_rms": fit.residual_rms,
+    }
+
+
+async def _subscribe_chain(
+    ws: WebSocket, adapter: DeribitAdapter, msg: dict, conversation_id: str,
+) -> Callable[[], None]:
+    currency = str(msg.get("currency") or "")
+    expiry = msg.get("expiry") or None
+    if not currency:
+        await ws.send_text(json.dumps({
+            "type": "error", "conversationId": conversation_id,
+            "message": "subscribe_chain requires currency",
+        }))
+        return lambda: None
+
+    async def pump() -> None:
+        try:
+            async for snap in adapter.chain_stream(currency):
+                rows = adapter.chain_rows(currency, expiry)
+                await ws.send_text(json.dumps({
+                    "type": "chain_snapshot",
+                    "conversationId": conversation_id,
+                    "data": {
+                        "currency": snap.currency,
+                        "expiry": expiry,
+                        "timestamp_ms": snap.timestamp_ms,
+                        "rows": [_row_dict(r) for r in rows],
+                        "expiries": snap.expiries(),
                     },
-                },
-            }
-            await ws.send_text(json.dumps(payload))
-    except (asyncio.CancelledError, WebSocketDisconnect):
-        pass
-    except Exception as exc:
-        log.warning("chain stream error: %s", exc)
+                }))
+        except (asyncio.CancelledError, WebSocketDisconnect):
+            pass
+        except Exception as exc:
+            log.warning("chain pump error: %s", exc)
+
+    task = asyncio.create_task(pump())
+    return lambda: task.cancel()
+
+
+async def _subscribe_smile(
+    ws: WebSocket, adapter: DeribitAdapter, msg: dict, conversation_id: str,
+) -> Callable[[], None]:
+    currency = str(msg.get("currency") or "")
+    expiry = str(msg.get("expiry") or "")
+    if not currency or not expiry:
+        await ws.send_text(json.dumps({
+            "type": "error", "conversationId": conversation_id,
+            "message": "subscribe_smile requires currency and expiry",
+        }))
+        return lambda: None
+
+    async def pump() -> None:
+        try:
+            async for snap in adapter.chain_stream(currency):
+                fit = adapter.smile_fit(currency, expiry)
+                payload = {
+                    "currency": currency,
+                    "expiry": expiry,
+                    "timestamp_ms": snap.timestamp_ms,
+                    "fit": _fit_dict(fit) if fit else None,
+                }
+                await ws.send_text(json.dumps({
+                    "type": "smile_snapshot",
+                    "conversationId": conversation_id,
+                    "data": payload,
+                }))
+        except (asyncio.CancelledError, WebSocketDisconnect):
+            pass
+        except Exception as exc:
+            log.warning("smile pump error: %s", exc)
+
+    task = asyncio.create_task(pump())
+    return lambda: task.cancel()
 
 
 async def _stream_rate_limit(ws: WebSocket, adapter: DeribitAdapter) -> None:

@@ -1,13 +1,14 @@
 import {
   createContext, useCallback, useContext, useEffect, useMemo, useRef, useState,
 } from 'react';
-import { DockviewReact } from 'dockview';
+import { DockviewReact, themeAbyss, themeLight } from 'dockview';
 import type {
   DockviewApi, DockviewReadyEvent, IDockviewPanelProps, SerializedDockview,
 } from 'dockview';
 import 'dockview/dist/styles/dockview.css';
 
 import { StatusPill } from '../components/StatusPill';
+import { useTheme } from '../hooks/useTheme';
 import { getWidget, allWidgets } from './widgetRegistry';
 import {
   DEFAULT_PROFILE,
@@ -17,6 +18,8 @@ import {
 
 // Trigger all widget registrations before the shell mounts.
 import '../widgets/Notes';
+import '../widgets/ChainTable';
+import '../widgets/SmileChart';
 
 // ---------- panel params ----------
 
@@ -57,7 +60,7 @@ function WidgetPanel({ api, params }: IDockviewPanelProps<PanelParams>) {
   }, [api, spec, stale, params.widgetId, params.configVersion, params.config]);
 
   if (!spec) {
-    return <div style={{ padding: 12, color: '#666', fontSize: 12 }}>Unknown widget: {params.widgetId}</div>;
+    return <div style={{ padding: 12, color: 'var(--fg-mute)', fontSize: 12 }}>Unknown widget: {params.widgetId}</div>;
   }
 
   // Render with migrated config until the effect persists it — avoids one frame of stale UI.
@@ -235,10 +238,18 @@ export function DockShell() {
 
   const onReady = useCallback((evt: DockviewReadyEvent) => {
     apiRef.current = evt.api;
+    evt.api.onDidLayoutChange(scheduleSave);
+    // updateParameters() does NOT fire onDidLayoutChange (Dockview only treats
+    // structural moves as layout changes). Without this hook, in-session widget
+    // config edits — column toggles, density, expiry rollover fallback —
+    // silently fail to persist into the active profile. Wiring per-panel here
+    // means the autosave mirrors what api.toJSON() would dump right now.
+    evt.api.onDidAddPanel(panel => {
+      panel.api.onDidParametersChange(scheduleSave);
+    });
     if (!tryLoadInto(evt.api, loadLayout(activeProfileRef.current))) {
       addShakedownPanel(evt.api);
     }
-    evt.api.onDidLayoutChange(scheduleSave);
   }, [scheduleSave]);
 
   const ctx = useMemo<ShellCtx>(() => ({
@@ -257,14 +268,24 @@ export function DockShell() {
       <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
         <ShellHeader />
         <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
-          <DockviewReact
-            className="dockview-theme-abyss"
-            components={COMPONENTS}
-            onReady={onReady}
-          />
+          <DockviewBody onReady={onReady} />
         </div>
       </div>
     </ShellContext.Provider>
+  );
+}
+
+function DockviewBody({ onReady }: { onReady: (e: DockviewReadyEvent) => void }) {
+  const { theme } = useTheme();
+  // Use the supported `theme` prop. Dockview defaults to `themeAbyss` if
+  // omitted, so passing the matching theme object every render keeps the
+  // class swap clean (no accumulation, no flicker).
+  return (
+    <DockviewReact
+      theme={theme === 'light' ? themeLight : themeAbyss}
+      components={COMPONENTS}
+      onReady={onReady}
+    />
   );
 }
 
@@ -276,6 +297,7 @@ function ShellHeader() {
     activeProfile, profiles, switchProfile, saveCurrentAs, deleteCurrent,
     exportProfiles, importProfilesFromFile,
   } = useDockShell();
+  const { theme, toggleTheme } = useTheme();
   const [savingAs, setSavingAs] = useState('');
   const [showSave, setShowSave] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -296,13 +318,21 @@ function ShellHeader() {
   return (
     <div style={{
       display: 'flex', alignItems: 'center', gap: 8,
-      padding: '5px 14px', borderBottom: '1px solid #1c1c2e',
-      background: '#0d0d1a', flexShrink: 0,
+      padding: '5px 14px', borderBottom: '1px solid var(--border)',
+      background: 'var(--bg-1)', flexShrink: 0,
+      fontFamily: 'var(--font-chrome)',
     }}>
-      <span style={{ fontSize: 13, fontWeight: 600, color: '#e0e0e0', letterSpacing: '0.04em' }}>
+      <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--fg)', letterSpacing: '0.04em' }}>
         deribit smile
       </span>
       <StatusPill />
+      <button
+        onClick={toggleTheme}
+        style={btnStyle}
+        title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+      >
+        {theme === 'dark' ? '☀ light' : '☾ dark'}
+      </button>
       <Spacer />
       {widgets.map(w => (
         <button key={w.id} onClick={() => addPanel(w.id)} style={btnStyle}>
@@ -338,7 +368,7 @@ function ShellHeader() {
 }
 
 function Spacer() { return <div style={{ flex: 1 }} />; }
-function Divider() { return <div style={{ width: 1, height: 14, background: '#2a2a3e', flexShrink: 0 }} />; }
+function Divider() { return <div style={{ width: 1, height: 14, background: 'var(--border)', flexShrink: 0 }} />; }
 
 interface ProfileSectionProps {
   activeProfile: string;
@@ -360,7 +390,7 @@ function ProfileSection(p: ProfileSectionProps) {
       <select
         value={p.activeProfile}
         onChange={e => p.onSwitch(e.target.value)}
-        style={{ background: '#0d0d1a', color: '#aaa', border: '1px solid #2a2a3e', borderRadius: 3, padding: '2px 6px', fontSize: 11, cursor: 'pointer' }}
+        style={{ background: 'var(--bg)', color: 'var(--fg-dim)', border: '1px solid var(--border)', borderRadius: 3, padding: '2px 6px', fontSize: 11, cursor: 'pointer', fontFamily: 'var(--font-chrome)' }}
       >
         {p.profiles.length === 0 && <option value={p.activeProfile}>{p.activeProfile}</option>}
         {p.profiles.map(name => <option key={name} value={name}>{name}</option>)}
@@ -376,9 +406,15 @@ function ProfileSection(p: ProfileSectionProps) {
               if (e.key === 'Enter') p.onCommitSave();
               if (e.key === 'Escape') p.onCloseSave();
             }}
-            style={{ background: '#0d0d1a', color: '#e0e0e0', border: '1px solid #444', borderRadius: 3, padding: '2px 6px', fontSize: 11, width: 110 }}
+            style={{ background: 'var(--bg)', color: 'var(--fg)', border: '1px solid var(--border)', borderRadius: 3, padding: '2px 6px', fontSize: 11, width: 110, fontFamily: 'var(--font-chrome)' }}
           />
-          <button onClick={p.onCloseSave} style={btnStyle}>✕</button>
+          <button
+            onClick={p.onCommitSave}
+            disabled={!p.savingAs.trim()}
+            title="Save (or press Enter)"
+            style={{ ...btnStyle, opacity: p.savingAs.trim() ? 1 : 0.4, cursor: p.savingAs.trim() ? 'pointer' : 'not-allowed' }}
+          >save</button>
+          <button onClick={p.onCloseSave} title="Cancel (Esc)" style={btnStyle}>✕</button>
         </>
       ) : (
         <button onClick={p.onOpenSave} style={btnStyle}>save as…</button>
@@ -396,6 +432,7 @@ function ProfileSection(p: ProfileSectionProps) {
 }
 
 const btnStyle: React.CSSProperties = {
-  background: '#0d0d1a', color: '#888', border: '1px solid #2a2a3e',
+  background: 'var(--bg)', color: 'var(--fg-dim)', border: '1px solid var(--border)',
   borderRadius: 3, padding: '2px 8px', cursor: 'pointer', fontSize: 11,
+  fontFamily: 'var(--font-chrome)',
 };

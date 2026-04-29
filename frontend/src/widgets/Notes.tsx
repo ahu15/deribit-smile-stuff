@@ -29,10 +29,10 @@ function Notes({ config, onConfigChange }: WidgetProps<NotesConfig>) {
       }}
       style={{
         width: '100%', height: '100%',
-        background: '#13131f', color: '#c8c8d8',
+        background: 'var(--bg-1)', color: 'var(--fg)',
         border: 'none', outline: 'none', resize: 'none',
         padding: 12, boxSizing: 'border-box',
-        fontFamily: 'ui-monospace, monospace', fontSize: 12, lineHeight: 1.6,
+        fontFamily: 'var(--font-data)', fontSize: 12, lineHeight: 1.6,
       }}
     />
   );

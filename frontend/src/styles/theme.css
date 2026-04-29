@@ -1,0 +1,81 @@
+/* Theme tokens — see COLOR_PALETTE.md for the rationale.
+ * Active palette is selected by data-theme on <html>. */
+
+:root,
+:root[data-theme='dark'] {
+  /* Surfaces */
+  --bg: #070a10;
+  --bg-1: #0d121c;
+  --bg-2: #161d2c;
+  --border: #1f2738;
+
+  /* Foreground (three levels — primary / dim / mute) */
+  --fg: #eaf2ff;
+  --fg-dim: #9aa6ba;
+  --fg-mute: #5a6478;
+
+  /* Semantic */
+  --accent: #5fb0ff;
+  --pos: #5fe89a;
+  --neg: #ff6a8a;
+  --bid: #ffa05a;
+  --ask: #5fb0ff;
+
+  /* Cell-level surfaces */
+  --itm: #101728;
+  --atm: #1c2438;
+
+  /* Tick-flash backgrounds (oklch with alpha) */
+  --flash-up: oklch(0.74 0.18 145 / 0.30);
+  --flash-down: oklch(0.66 0.21 25 / 0.30);
+
+  /* Density (overridable per ChainTable instance) */
+  --row-h: 22px;
+}
+
+:root[data-theme='light'] {
+  --bg: #f4f6fa;
+  --bg-1: #e8ecf3;
+  --bg-2: #d2dae6;
+  --border: #c2cbdb;
+
+  --fg: #0e1828;
+  --fg-dim: #3e4a60;
+  --fg-mute: #6a7388;
+
+  --accent: #1e6dd8;
+  --pos: #1f7a3a;
+  --neg: #b8242c;
+  --bid: #a23a3a;
+  --ask: #1e6dd8;
+
+  --itm: #dde3ee;
+  --atm: #c8d2e2;
+
+  --flash-up: oklch(0.74 0.16 145 / 0.22);
+  --flash-down: oklch(0.55 0.20 25 / 0.22);
+
+  --row-h: 22px;
+}
+
+/* Type stacks */
+:root {
+  --font-chrome: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-data: 'Commit Mono', 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+}
+
+html, body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-chrome);
+  font-feature-settings: 'cv11' on; /* Inter — slashed zero */
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Anything inside a numeric data surface should pick up the mono stack and
+ * tabular figures by default. Components that need monos elsewhere can opt
+ * in by setting class="mono" or font-family directly. */
+.mono, [data-mono] {
+  font-family: var(--font-data);
+  font-variant-numeric: tabular-nums;
+}

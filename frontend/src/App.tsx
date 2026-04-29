@@ -1,15 +1,18 @@
 import { DockShell } from './shell/DockShell';
+import { ThemeProvider } from './hooks/useTheme';
 
 export default function App() {
   return (
-    <div style={{
-      height: '100vh',
-      background: '#0d0d1a',
-      color: '#e0e0e0',
-      fontFamily: 'ui-monospace, monospace',
-      overflow: 'hidden',
-    }}>
-      <DockShell />
-    </div>
+    <ThemeProvider>
+      <div style={{
+        height: '100vh',
+        background: 'var(--bg)',
+        color: 'var(--fg)',
+        fontFamily: 'var(--font-chrome)',
+        overflow: 'hidden',
+      }}>
+        <DockShell />
+      </div>
+    </ThemeProvider>
   );
 }

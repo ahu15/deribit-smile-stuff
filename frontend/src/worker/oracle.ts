@@ -10,6 +10,7 @@ import './pingService';
 import './chainService';
 import './rateLimitService';
 import './historyService';
+import './smileService';
 
 const BACKEND_WS = 'ws://localhost:8000/ws/oracle';
 

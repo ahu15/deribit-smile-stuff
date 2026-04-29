@@ -5,7 +5,11 @@ from collections import defaultdict
 from collections.abc import AsyncIterator
 
 from backend.backfill import Backfill
-from backend.chain import BookSummary, ChainSnapshot, OptionMark, parse_expiry
+from backend.chain import (
+    BookSummary, ChainRow, ChainSnapshot, OptionMark,
+    expiry_ms, parse_expiry, parse_option_type, parse_strike,
+)
+from backend.fit import FitResult, fit_smile
 from backend.history import HistoryStore
 from backend.ratelimit import RateLimitStatus
 from backend.venues.base import VenueAdapter
@@ -16,6 +20,8 @@ log = logging.getLogger(__name__)
 
 _SUPPORTED_CURRENCIES = ["BTC", "ETH"]
 _POLL_INTERVAL = 2.0  # seconds between book-summary polls
+_HOUR_MS = 60 * 60 * 1000
+_DAY_MS = 24 * _HOUR_MS
 
 
 class DeribitAdapter(VenueAdapter):
@@ -144,6 +150,93 @@ class DeribitAdapter(VenueAdapter):
         self._merge(currency, summaries)
         snap = self._snapshots.get(currency)
         return list(snap.book_summaries.values()) if snap else []
+
+    # ---------- M3 chain & smile views ----------
+
+    def latest_snapshot(self, currency: str) -> ChainSnapshot | None:
+        return self._snapshots.get(currency)
+
+    def expiries(self, currency: str) -> list[str]:
+        snap = self._snapshots.get(currency)
+        return snap.expiries() if snap else []
+
+    def chain_rows(self, currency: str, expiry: str | None) -> list[ChainRow]:
+        snap = self._snapshots.get(currency)
+        if not snap:
+            return []
+        rows: list[ChainRow] = []
+        for name, mark in snap.marks.items():
+            inst_expiry = parse_expiry(name)
+            if expiry and inst_expiry != expiry:
+                continue
+            strike = parse_strike(name)
+            opt_type = parse_option_type(name)
+            if strike is None or opt_type is None or inst_expiry is None:
+                continue
+            book = snap.book_summaries.get(name)
+            bid = book.bid_price if book else None
+            ask = book.ask_price if book else None
+            mid = 0.5 * (bid + ask) if (bid is not None and ask is not None) else None
+            spread = (ask - bid) if (bid is not None and ask is not None) else None
+
+            rows.append(ChainRow(
+                instrument_name=name,
+                expiry=inst_expiry,
+                strike=strike,
+                option_type=opt_type,
+                mark_iv=mark.mark_iv,
+                bid_iv=book.bid_iv if book else None,
+                ask_iv=book.ask_iv if book else None,
+                mark_price=mark.mark_price,
+                bid_price=bid,
+                ask_price=ask,
+                mid_price=mid,
+                spread=spread,
+                open_interest=book.open_interest if book else 0.0,
+                volume_24h=book.volume_24h if book else 0.0,
+                underlying_price=mark.underlying_price,
+                change_1h=self.history.change(name, "mark", _HOUR_MS),
+                change_24h=self.history.change(name, "mark", _DAY_MS),
+                change_iv_1h=self.history.change(name, "mark_iv", _HOUR_MS),
+                timestamp_ms=mark.timestamp_ms,
+            ))
+        rows.sort(key=lambda r: (expiry_ms(r.expiry) or 0, r.strike, r.option_type))
+        return rows
+
+    def smile_fit(self, currency: str, expiry: str) -> FitResult | None:
+        """Fit SABR to the option-implied IVs for one expiry of the latest chain.
+
+        Uses both calls and puts; Deribit's mark_iv agrees across the parity
+        pair, so combining gives a denser quote set without bias.
+        """
+        snap = self._snapshots.get(currency)
+        if not snap:
+            return None
+        forward = 0.0
+        # Per-strike: prefer the side with non-zero IV. If both have IV, average.
+        by_strike: dict[float, list[float]] = defaultdict(list)
+        for name, mark in snap.marks.items():
+            if parse_expiry(name) != expiry:
+                continue
+            strike = parse_strike(name)
+            if strike is None or mark.mark_iv <= 0:
+                continue
+            by_strike[strike].append(mark.mark_iv)
+            if mark.underlying_price > 0:
+                forward = mark.underlying_price
+        if forward <= 0 or not by_strike:
+            return None
+
+        ex_ms = expiry_ms(expiry)
+        if ex_ms is None:
+            return None
+        t_years = (ex_ms - snap.timestamp_ms) / (365.0 * 86400.0 * 1000.0)
+        if t_years <= 0:
+            return None
+
+        strikes = sorted(by_strike.keys())
+        ivs = [sum(by_strike[k]) / len(by_strike[k]) for k in strikes]
+        return fit_smile(forward, t_years, strikes, ivs, beta=1.0)
 
     async def ping_deribit(self) -> dict:
         """Round-trip ping that hits Deribit — for end-to-end pingService test."""
