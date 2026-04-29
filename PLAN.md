@@ -7,11 +7,12 @@ A local web app for screening Deribit options: live chain views, live and stale-
 ## Hard constraints
 
 - **Local app**, single user. No deploy, no auth.
-- **No disk persistence.** Everything is in-memory, session-scoped. Three layers:
-  - On-demand fetches from Deribit for trades / candles / DVOL (~24h lookback).
-  - Per-instrument spread ring buffer (Deribit doesn't expose historic L2).
-  - Chain-snapshot ring buffer (1-min cadence, rolling 24h) feeding Analysis Mode — see below.
-  - On startup: a backfill job reconstructs "today so far" using Deribit trades + candles so the analysis views have history before the app's been running for hours.
+- **No disk persistence.** Everything is in-memory, session-scoped. The historical & live data layer (M2.5) holds:
+  - Per-instrument time-series of mark / mark_iv / bid / ask / spread, capped at ~24h.
+  - Per-currency aggregate series (DVOL, perp price, index, forward curve points).
+  - Per-instrument trade-print log, capped at ~24h.
+  - On startup: a backfill job reconstructs "today so far" using `get_last_trades_by_currency`, `get_tradingview_chart_data`, and `get_volatility_index_data` so any view that opens has history immediately.
+  - The live REST poll loop appends to the same store; readers and writers share one source of truth.
 - **Currencies**: BTC + ETH at launch, SOL by config flip, room for more.
 - **Cross-venue**: Bloomberg via `xbbg` later for IBIT / ETHA arb. Architecture must allow more venues (OKX, Bybit, Paradigm, etc.) without core changes.
 - **SABR**: use `sabr_greeks.py` as-is. β = 1 default (matches Deribit lognormal quoting). Per-expiry independent fits.
@@ -198,16 +199,13 @@ Bloomberg-style deep-dive on a clicked option. Click an option in `ChainTable` (
 
 ### Implementation
 
-- **`AnalysisService` in the oracle.** Holds a chain-snapshot ring buffer (1-min cadence, rolling 24h, ~36MB per currency). Live polling appends; nothing hits disk.
-- **Startup backfill.** Before the ring buffer has any depth, fetch:
-  - `get_last_trades_by_instrument_and_time` for each expiry's instruments (current trading day).
-  - `get_tradingview_chart_data` for the perp and each future (forward path).
-  - Bucket trades into time windows (5–15 min), fit SABR per bucket via `sabr_greeks.SABRfit` to seed the historical-fit time series.
+- **`AnalysisService` in the oracle.** Reads from the M2.5 data layer — does not own its own buffer or run its own backfill. Computes analysis-specific derivatives on top of the existing time-series store.
+- **Bucketing + per-bucket SABR fits.** On first subscription per (symbol, expiry), bucket the layer's trades + chain-history into 5–15 min windows and fit SABR per bucket via `sabr_greeks.SABRfit`. Cache the seeded `fitHistory` so re-opens are cheap.
 - **Service surface (AsyncGenerator-yielding):**
   - `fitHistory(symbol, expiry)` → series of `{ts, alpha, rho, volvol, residualRMS}`.
-  - `priceHistory(instrumentName)` → series of `{ts, mid_btc, mid_usd, bid, ask}` + trade prints.
+  - `priceHistory(instrumentName)` → series of `{ts, mid_btc, mid_usd, bid, ask}` + trade prints (read from data layer).
   - `greeksHistory(instrumentName)` → series of `{ts, delta, gamma, vega, theta}` computed from the historical fit at each ts and the spot at that ts.
-  - `forwardHistory(symbol)` → series of forward curves through the day.
+  - `forwardHistory(symbol)` → series of forward curves through the day (read from data layer).
   - `decayDecomposition(instrumentName)` → series of `{ts, theoreticalTheta, actualPnL, volSpotResidual}`.
 
 ### Layout templates with parameter binding
@@ -234,7 +232,7 @@ deribit smile stuff/
 │   │   └── registry.py
 │   ├── chain.py                      # snapshot model, expiry grouping, T calc
 │   ├── fit.py                        # uses sabr_greeks.SABRfit
-│   ├── history.py                    # on-demand trade/IV/DVOL fetchers (use rest_client)
+│   ├── history.py                    # M2.5 data layer: rolling 24h time-series store + startup backfill
 │   └── ratelimit.py                  # token bucket primitives, status pill feed
 └── frontend/                         # Vite + React + TS
     ├── vite.config.ts
@@ -245,8 +243,8 @@ deribit smile stuff/
         │   ├── transport.ts          # MessagePort framing
         │   ├── chainService.ts       # dual-mode
         │   ├── staleFitService.ts    # dual-mode
-        │   ├── historyService.ts     # dual-mode (ring buffer + on-demand)
-        │   ├── analysisService.ts    # dual-mode (chain snapshot ring + backfill + fit/greeks history)
+        │   ├── historyService.ts     # dual-mode: subscribes to backend M2.5 data layer (series + trades + helpers)
+        │   ├── analysisService.ts    # dual-mode: reads historyService, adds bucketed SABR fits + decay decomposition
         │   └── oracle.ts             # SharedWorker entrypoint
         ├── hooks/
         │   └── useSubscription.ts    # wraps `for await` into React state
@@ -287,11 +285,33 @@ deribit smile stuff/
    - Frontend SharedWorker oracle (`oracle.ts`) with DedicatedWorker fallback. `HRTWorker` module exposes `isOracleContext` mode detection, `registerService` / `getService`, a refcounted `acquireSharedStream` (per-key dedup across tabs), and `subscribeRemote` returning AsyncGenerators. Conversation-id protocol in `transport.ts`.
    - Three dual-mode services: `pingService` (Deribit→backend→oracle→tab roundtrip, the M1 e2e test), `chainService`, `rateLimitService`.
    - React UI: `StatusPill` (bucket %, queue depth, last-throttled), `ChainView` (currency, instrument count, spot, snapshot timestamp), `PingView` (rtt, clock skew, last roundtrip).
-2. **M2 — Widget shell.** Dockview integration, widget registry, layout persistence (named profiles, JSON import/export), popout support. Ship with `Notes` widget to shake out drag/resize/popout/save.
-3. **M3 — Chain + live smile.** `ChainTable` (virtualized, toggleable columns) and `SmileChart` (live mode). Both take `{venue, symbol, expiry}`.
-4. **M3.5 — Stale-fit smile.** `SmileChart` stale-fit mode with wall-clock-aligned interval; `SmileGrid` small-multiples. New `StaleFitService` in oracle.
-5. **M4 — Click-through.** `InstrumentDetail` widget for quick-look. `ChainTable` row-click opens it as a new dock panel (with "pop out" button). Spread ring buffer wired up.
-6. **M4.5 — Analysis Mode.** `AnalysisService` in oracle: chain-snapshot ring buffer, **rate-limit-aware staged backfill** (priority queue, currency-wide trades aggregation, ATM-first ordering, dead-instrument skipping), fit/greeks/forward/decay history streams. Six analysis widgets. Layout-template-with-parameter-binding mechanism in the shell. "Open Analysis" action on `ChainTable` and `InstrumentDetail` spawns a tab group bound to the clicked instrument. Backfill progress + bucket state visible in status pill.
+2. **M2 — Widget shell.** ✅ **Complete (2026-04-29).** Delivered:
+   - Dockview shell (`DockShell.tsx`) with the abyss theme, embedded `StatusPill`, and a single `widget` panel component that dispatches via the registry.
+   - `widgetRegistry` exposes `WidgetSpec<TConfig>` (id, title, component, `defaultConfig`, `configVersion`, optional `migrate`, optional `accentColor`) and `registerWidget` / `getWidget` / `allWidgets`. Dev-mode warning on duplicate registration. Each registered widget gets a "+ Title" button in the header automatically.
+   - `WidgetPanel` wrapper handles config-version migration: when a stored panel's `configVersion` differs from the spec, it renders with the migrated config on the same frame and persists the migrated value via `api.updateParameters` in an effect, so a stored layout migrates exactly once. `onConfigChange` always writes back the *current* spec version, fixing a drift bug where edits would otherwise re-stamp the old version.
+   - Layout persistence in `localStorage` (`layoutPersistence.ts`): named profiles, debounced auto-save (500 ms) on every dockview layout change, flush-on-unmount, active-profile pointer survives reload. JSON export downloads a versioned `ProfileBundle` (`{version: 1, active, profiles}`); JSON import restores all profiles, switches to the bundle's active profile, and validates the version + name shapes.
+   - Profile management UI: dropdown switcher, "save as…" inline input (Enter/Esc), delete (disabled when active = `default`, confirms before deleting, falls back to default on success), and JSON export/import buttons (file input + download anchor).
+   - Popout: header "⇱ popout" button calls `api.addPopoutGroup(activePanel)`. Pop-outs reuse the same browser context, so the future SharedWorker oracle remains a single subscriber.
+   - Notes shakedown widget: simple textarea with debounced (400 ms) save, flush-pending-edit on unmount, gray accent stripe.
+   - Vite hardening: `resolve.dedupe: ['react','react-dom']` to stop dockview's CJS pre-bundle from instantiating a second React copy (which had been firing "Invalid hook call" warnings in dev). `vite-env.d.ts` added.
+   - Browser-verified end-to-end: add panel, save-as, switch profile, JSON export round-trip, JSON import (new profile becomes active and renders), delete (falls back to default), Notes config persisted with correct `configVersion`, full state restored on reload.
+3. **M2.5 — Historical & live data layer.** Single in-memory source of truth that every later view reads from for any "vs N hours ago" / "1d change" / "session high-low" computation. Built once, leveraged by M3+, M4, M4.5, and M5.
+   - **Storage**: per-instrument time-indexed deques per field (mark, mark_iv, bid_price, ask_price, mid, ...), session-scoped, no disk, capped at ~24h. Plus per-currency aggregate series (DVOL, perp, index, forward curve) and per-instrument trade-print logs.
+   - **Startup backfill** (priority-low, yields to live UI via `PriorityRestQueue`):
+     - `get_last_trades_by_currency` — one call per ccy returns trades across all instruments; cheap, dense, the right tool for seeding per-instrument mark/IV history.
+     - `get_tradingview_chart_data` — perp + each future for the forward path through the day.
+     - `get_volatility_index_data` — DVOL series.
+   - **Skip dead instruments** (no trades in lookback window) to avoid wasted calls. ATM-first ordering so the in-focus expiry has depth fastest.
+   - **Live append**: the existing 2s `chain_stream` poll appends to the same store; readers and writers share one source of truth.
+   - **Service surface** (oracle-side `historyService`):
+     - `seriesStream(instrument, field)` — initial 24h snapshot then live appends as they arrive.
+     - `trades(instrument)` — initial backfill then new prints.
+     - Helper queries: `change(instrument, field, lookback)`, `session_open(instrument, field)`, `range(instrument, field, t0, t1)`.
+   - Status pill grows a backfill-progress indicator (`history: 78%`).
+4. **M3 — Chain + live smile.** `ChainTable` (virtualized, toggleable columns including `change_1h`, `change_24h` from the data layer) and `SmileChart` (live mode). Both take `{venue, symbol, expiry}`.
+5. **M3.5 — Stale-fit smile.** `SmileChart` stale-fit mode with wall-clock-aligned interval; `SmileGrid` small-multiples. New `StaleFitService` in oracle.
+6. **M4 — Click-through.** `InstrumentDetail` widget for quick-look. `ChainTable` row-click opens it as a new dock panel (with "pop out" button). Trade-IV history chart and spread ring buffer chart both read from the M2.5 data layer — no extra Deribit calls beyond the one new `public/ticker` poll for the open instrument.
+7. **M4.5 — Analysis Mode.** `AnalysisService` in oracle computes analysis-specific derivatives on top of the M2.5 data layer: bucketed SABR fits per time window (`fitHistory`), `greeksHistory` from historical fit + spot, `decayDecomposition` (theoretical θ vs actual P&L). Six analysis widgets. Layout-template-with-parameter-binding mechanism in the shell. "Open Analysis" action on `ChainTable` and `InstrumentDetail` spawns a tab group bound to the clicked instrument.
 7. **M5 — Surface, forwards, DVOL, pricer.** `SurfaceHeatmap`, `ForwardCurve`, `DvolPanel`, `Pricer`.
 8. **M6 — Bloomberg.** Bloomberg `VenueAdapter` via `xbbg`. `IbitArb` and `EthaArb` cross-venue widgets.
 9. **M7 — Open-ended.** Additional venues (OKX, Bybit, Paradigm) as adapters; existing widgets pick them up automatically.
