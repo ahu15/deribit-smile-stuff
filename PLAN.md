@@ -57,22 +57,22 @@ Deribit applies account-scoped credit-bucket rate limits with separate matching-
 ### Architectural rules
 
 1. **Backend is the only process talking to Deribit.** Browser-side code (SharedWorker, tabs, popouts) never connects directly. One backend = one rate-limit footprint regardless of how many tabs/widgets are open.
-2. **WebSocket subscriptions over REST polling for live data.** REST is reserved for one-shots: startup backfill, on-demand history, sizes/OI refreshes that aren't in any WS channel.
-3. **Authenticated WS session.** Use a read-only API key for the backend's connection — better limits than anonymous, and required for some private channels we won't use but is also generally polite to identify ourselves.
-4. **Single shared WS connection per process.** Don't open one WS per widget; multiplex.
+2. **REST throughout. No WS.** This screener never asks for sub-1s data fidelity at any level — chain views, per-instrument detail, forwards, trades. `get_book_summary_by_currency` at 2s gives a coherent atomic snapshot of an entire chain in one call, and `public/ticker?instrument_name=X` at 2s gives full per-instrument detail (sizes, greeks, bid/ask IVs) for any one option being inspected. At human-paced render rates the difference vs WS is invisible, the code is simpler, the rate-limit footprint is small, and the corp proxy doesn't block it. WS subscriptions are out of the production path — the codebase ships REST-only.
+3. **Token-bucket-paced polling.** All polling loops submit through the rate-limit-aware REST client (`PriorityRestQueue` + `TokenBucket`) so live-UI fetches preempt backfill jobs and 10028 / 429 responses trigger exponential backoff with jitter.
 
 ### Channel selection
 
-| Use | Channel / endpoint | Cadence | Rationale |
+| Use | Endpoint | Cadence | Rationale |
 |---|---|---|---|
-| Whole-currency option mark + IV | `markprice.options.{ccy}` (WS) | streamed | Replaces 2s `book_summary` poll for the IV column. Single channel covers all options for a currency. |
-| Per-instrument best bid/ask + size (visible widgets) | `quote.{instrument}` (WS) | streamed | Only subscribe for instruments currently visible in a `ChainTable` / `InstrumentDetail` / Analysis group. Dynamic sub/unsub. |
-| Per-instrument trades (visible widgets) | `trades.{instrument}.100ms` (WS) | streamed | Same dynamic-sub pattern. |
-| Forwards (perp + futures) | `ticker.{instrument}.100ms` (WS) | streamed | One sub per perp/future per ccy — small fixed set. |
-| OI / daily volume refresh | `get_book_summary_by_currency` (REST) | ~30s | Bulk endpoint; OI/volume not in `markprice.options`. One call per ccy per refresh. |
-| Trade-print history (Analysis backfill, `InstrumentDetail`) | `get_last_trades_by_instrument_and_time` (REST) | on-demand | Throttled, prioritized. |
-| Forward candle history | `get_tradingview_chart_data` (REST) | on-demand | One call per perp/future at backfill. |
-| DVOL series | `get_volatility_index_data` (REST) | on-demand | One call per widget mount, then refresh on a slow timer. |
+| Whole-currency option chain (mark, IV, bid/ask, OI, volume, mid, last, price_change) | `public/get_book_summary_by_currency` (REST) | 2s | One call per currency returns every option with the chain-table fields. Atomic snapshot. ~1 token/call. **Note: this endpoint does *not* return bid/ask sizes** — see ChainTable note below. |
+| Per-instrument detail (sizes, bid_iv / ask_iv, greeks, full quote) | `public/ticker?instrument_name=X` (REST) | 2s, only while `InstrumentDetail` is open | One call per visible detail widget. Cheap because only the in-focus option is polled, not the whole chain. |
+| Forwards (perp + futures) | `public/ticker?instrument_name=BTC-PERPETUAL` (REST) | 2s | Underlying price for the chain comes free in `get_book_summary_by_currency`; an explicit ticker poll is only needed for perp basis / funding (M5 `ForwardCurve`) and forward-curve term structure. Small fixed set per currency. |
+| Trade-print stream (`InstrumentDetail`, Analysis backfill) | `public/get_last_trades_by_instrument_and_time` (REST) | 2s delta-fetch while detail open; one bulk fetch on Analysis open | Each poll asks for trades since the last poll's max timestamp — only new prints come back. Throttled, prioritized via `PriorityRestQueue` (live UI > backfill). |
+| Forward candle history | `public/get_tradingview_chart_data` (REST) | on-demand | One call per perp/future at Analysis-mode backfill. |
+| DVOL series | `public/get_volatility_index_data` (REST) | on-demand at widget mount, then 60s refresh | DVOL changes slowly; aggressive polling adds nothing. |
+| End-to-end heartbeat | `public/get_time` (REST) | on-demand by `pingService` | Cheap roundtrip for the M1 e2e test; surfaces backend-↔-Deribit RTT and clock skew in the UI. |
+
+**ChainTable sizes column.** `get_book_summary_by_currency` deliberately omits `best_bid_amount` / `best_ask_amount`. The chain table therefore won't show sizes by default. If a user toggles a "sizes" column on, the widget would have to per-instrument-poll `public/ticker` for every visible row (~30 rows × 2 ccy / 2s ≈ 30 req/s — at or above bucket). Default for now: omit sizes from `ChainTable`; sizes show up in `InstrumentDetail` (M4) which is single-instrument and cheap. Revisit if a real workflow needs at-a-glance sizes.
 
 ### Dynamic subscription management
 
@@ -162,7 +162,7 @@ Adding a widget = registering one entry. Each widget instance is an independent 
 
 | Widget | Config | Notes |
 |---|---|---|
-| `ChainTable` | `{venue, symbol, expiry, columns[]}` | Virtualized scroll. Toggleable cols: mid$, mid₿, IV, spread bps, spread $, size bid/ask, OI, Δ, Γ, ν, residual-vs-SABR. |
+| `ChainTable` | `{venue, symbol, expiry, columns[]}` | Virtualized scroll. Toggleable cols: mid$, mid₿, IV, spread bps, spread $, OI, Δ, Γ, ν, residual-vs-SABR. **Bid/ask sizes intentionally not in the default set** (book_summary doesn't return them — see data strategy). |
 | `SmileChart` | `{venue, symbol, expiry, mode: 'live' \| 'staleFit', intervalMin?}` | Two modes in one component. |
 | `SmileGrid` | `{venue, symbol, mode}` | Small-multiples of all expiries. |
 | `SurfaceHeatmap` | `{venue, symbol}` | (T, log-moneyness) heatmap. |
@@ -227,10 +227,9 @@ deribit smile stuff/
 │   │   ├── base.py                   # VenueAdapter interface
 │   │   ├── deribit/
 │   │   │   ├── __init__.py
-│   │   │   ├── adapter.py            # impl
-│   │   │   ├── ws_client.py          # auth, single shared WS, channel sub/unsub
+│   │   │   ├── adapter.py            # REST polling, ChainSnapshot assembly
 │   │   │   ├── rest_client.py        # rate-limit-aware (token bucket, priority queue, backoff)
-│   │   │   └── auth.py               # read-only API key handling
+│   │   │   └── auth.py               # read-only API key handling (optional)
 │   │   ├── bloomberg.py              # later
 │   │   └── registry.py
 │   ├── chain.py                      # snapshot model, expiry grouping, T calc
@@ -280,7 +279,14 @@ deribit smile stuff/
 
 ## Milestones
 
-1. **M1 — Backend + worker scaffolding.** FastAPI with `VenueAdapter` interface, Deribit impl with: (a) authenticated WS connection subscribing to `markprice.options.{BTC,ETH}` and ticker channels for perps/futures, (b) ~30s REST `get_book_summary_by_currency` refresh for OI/volume, (c) rate-limit-aware REST client (token bucket, priority queue, 10028 backoff), (d) WS endpoint pushing snapshots to the oracle. SharedWorker oracle scaffolding (HRTWorker base class, conversation protocol, mode detection, graceful fallback, refcounted dynamic subscriptions). End-to-end `pingService` test: a tab consumes a stream that originated from Deribit through the worker through the backend. Status pill in the UI showing rate-limit state.
+1. **M1 — Backend + worker scaffolding.** ✅ **Complete (2026-04-28).** Delivered:
+   - FastAPI app with `VenueAdapter` ABC and a `DeribitAdapter` that polls Deribit REST. The build initially attempted an authenticated WS connection per the original plan, then pivoted to REST-only after (a) the corp proxy blocks WS upgrade and (b) sub-1s data fidelity isn't a goal at any level (see [data strategy](#rate-limits--data-strategy)).
+   - Chain-level data: `get_book_summary_by_currency` polled every 2s per currency (BTC + ETH), normalised into `ChainSnapshot { marks, book_summaries }`. IV is normalised from percent → decimal at the adapter boundary.
+   - Rate-limit-aware REST client: `TokenBucket` (5 tok/s sustained, 20 burst) + `PriorityRestQueue` (live-UI vs backfill priorities) + 10028 / 429 exponential backoff with jitter. `truststore.SSLContext` wired into `httpx` for corp-proxy SSL.
+   - `/ws/oracle` WS endpoint (browser ↔ backend, not Deribit ↔ backend) streams `chain_snapshot` and `rate_limit_status` envelopes; also handles a `ping` round-trip via Deribit `public/get_time`.
+   - Frontend SharedWorker oracle (`oracle.ts`) with DedicatedWorker fallback. `HRTWorker` module exposes `isOracleContext` mode detection, `registerService` / `getService`, a refcounted `acquireSharedStream` (per-key dedup across tabs), and `subscribeRemote` returning AsyncGenerators. Conversation-id protocol in `transport.ts`.
+   - Three dual-mode services: `pingService` (Deribit→backend→oracle→tab roundtrip, the M1 e2e test), `chainService`, `rateLimitService`.
+   - React UI: `StatusPill` (bucket %, queue depth, last-throttled), `ChainView` (currency, instrument count, spot, snapshot timestamp), `PingView` (rtt, clock skew, last roundtrip).
 2. **M2 — Widget shell.** Dockview integration, widget registry, layout persistence (named profiles, JSON import/export), popout support. Ship with `Notes` widget to shake out drag/resize/popout/save.
 3. **M3 — Chain + live smile.** `ChainTable` (virtualized, toggleable columns) and `SmileChart` (live mode). Both take `{venue, symbol, expiry}`.
 4. **M3.5 — Stale-fit smile.** `SmileChart` stale-fit mode with wall-clock-aligned interval; `SmileGrid` small-multiples. New `StaleFitService` in oracle.
@@ -293,11 +299,12 @@ deribit smile stuff/
 ## Defaults locked in
 
 - SABR: β = 1, per-expiry independent fits via `sabr_greeks.SABRfit`.
-- Live data: WebSocket-first via `markprice.options.{ccy}` + dynamic per-instrument `quote` / `trades` subs.
-- REST refresh for OI/volume: ~30s.
+- Data transport: **REST throughout, polled at 2s.** No WS in the production path. Sub-1s fidelity is a non-goal for this screener at every level (chain, per-instrument, forwards, trades).
+- Chain-level: `get_book_summary_by_currency` per currency every 2s. Sizes are *not* shown in `ChainTable` by default (require per-instrument calls — see [data strategy](#rate-limits--data-strategy)).
+- Per-instrument: `public/ticker` per open `InstrumentDetail` every 2s; `get_last_trades_by_instrument_and_time` delta-fetched at 2s for the trade-print panel.
 - Stale-fit cadence: default 5 min, wall-clock-aligned, configurable 1–30 min per widget instance.
 - History lookback: ~24h, fetched on demand from Deribit when `InstrumentDetail` opens.
-- Spread history: in-memory ring buffer, session-scoped, no disk.
+- Spread history: in-memory ring buffer, session-scoped, no disk; appended from each `public/ticker` poll while `InstrumentDetail` is open.
 - Currency color accents: BTC orange, ETH purple, SOL cyan, equity ETF white.
 - Profile storage: `localStorage`, with JSON import/export.
 
@@ -307,5 +314,5 @@ deribit smile stuff/
 - Whether `Pricer` should support multi-leg (spreads/flies) at M5 or wait.
 - DVOL display: gauge vs sparkline vs both.
 - Whether to expose raw fit residuals as a dedicated diagnostic widget.
-- **Rate-limit specifics**: confirm exact token-bucket numbers for our account tier from the live Deribit rate-limits page; the strategy is conservative but the configured `sustained_rate` / `burst_size` / per-endpoint cost weights should match real values. The rate-limits page was unreachable through the corp proxy when this plan was written.
-- Whether to ever fall back to anonymous mode if the read-only API key is unavailable, or hard-fail at startup.
+- **Rate-limit specifics**: confirm exact token-bucket numbers for our account tier from the live Deribit rate-limits page; the configured `sustained_rate` / `burst_size` / per-endpoint cost weights are conservative defaults pending verification. M1 REST polling at 2s × 2 currencies sits at ~1 req/s sustained — well under any plausible bucket — so this isn't blocking.
+- **Sizes in ChainTable**: deliberately omitted because `book_summary` doesn't carry them and per-instrument polling for every visible row hits rate-limit bucket. Revisit if a real screening workflow surfaces a need for at-a-glance sizes (e.g. spread-trader looking for fillable size on the wings).
