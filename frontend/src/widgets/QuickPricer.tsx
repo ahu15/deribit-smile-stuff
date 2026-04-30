@@ -998,11 +998,17 @@ function OverrideCell({
 interface Totals {
   premLive: number;
   premOverride: number;
+  // Package bps = Σ q_i · leg_bps_i. Each leg's bps is the per-contract
+  // `premium / F` figure already shown in its row, so this sums to whatever
+  // the trader gets by adding the signed leg bps in their head — a 1×1
+  // vertical at +50/+30 reads as +20, not the smaller value the previous
+  // `signed_$ / Σ|q|·F` definition produced (different denominator from
+  // per-leg, so the column never reconciled).
+  bpsLive: number;
   // Per-greek-column package totals. Each leg dollarises against its own
   // forward (mixed-expiry packages would otherwise mis-aggregate), then we
   // sum the qty-weighted contributions.
   greeks: Record<GreekColId, number>;
-  notional: number;     // Σ|qty_i|·F_i, denominator for bps
   hasOverride: boolean;
 }
 
@@ -1016,20 +1022,31 @@ function emptyGreekTotals(): Record<GreekColId, number> {
 }
 
 function sumTotals(rows: LegRowData[], unitDenom: number, taker: boolean): Totals {
-  let premLive = 0, premOverride = 0;
-  let notional = 0; let hasOverride = false;
+  let premLive = 0, premOverride = 0, bpsLive = 0;
+  let hasOverride = false;
   const greeks = emptyGreekTotals();
   const scale = unitDenom > 0 ? 1 / unitDenom : 1;
   for (const r of rows) {
     const q = r.leg.qty * scale;
-    if (r.live.fwd != null) notional += Math.abs(q) * r.live.fwd;
-    // $LIVE total: taker mode swaps each leg's premium for the screen fill.
-    // When the bid/ask isn't available (illiquid strike), fall back to the
-    // model's mark-IV theoretical so the total isn't stuck at NaN.
-    const liveSource = taker && r.takerPremiumFwd != null
+
+    // $LIVE + bps source share one selector so the two columns stay in
+    // lockstep. Taker mode swaps each leg's premium for the screen fill;
+    // when the bid/ask isn't available (illiquid strike), fall back to the
+    // model's mark-IV theoretical so the totals aren't stuck at NaN.
+    const liveUsd = taker && r.takerPremiumFwd != null
       ? r.takerPremiumFwd
       : r.livePrice?.premium_fwd ?? null;
-    if (liveSource != null) premLive += q * liveSource;
+    if (liveUsd != null) premLive += q * liveUsd;
+
+    // legBps is the same per-1-contract figure each leg row shows; q-weighted
+    // and signed so reading the leg bps top-down sums to the totals value.
+    const legBps = taker && r.takerCoinPrice != null
+      ? r.takerCoinPrice * 10_000
+      : (r.livePrice && r.live.fwd != null && r.live.fwd > 0
+          ? (r.livePrice.premium_fwd / r.live.fwd) * 10_000
+          : null);
+    if (legBps != null) bpsLive += q * legBps;
+
     const greeksSrc = (r.hasAnyOverride && r.overridePrice) ? r.overridePrice : r.livePrice;
     const greekFwd = (r.hasAnyOverride && r.overridePrice && r.effective.fwd != null)
       ? r.effective.fwd
@@ -1041,22 +1058,19 @@ function sumTotals(rows: LegRowData[], unitDenom: number, taker: boolean): Total
       }
     }
     if (r.hasAnyOverride) hasOverride = true;
-    if (r.overridePrice) premOverride += q * r.overridePrice.premium_fwd;
-    else if (r.livePrice) premOverride += q * r.livePrice.premium_fwd;
+
+    // Override $: prefer the override-priced figure when present, fall back
+    // to live so the column doesn't blink to — on legs without overrides.
+    const ovrUsd = r.overridePrice?.premium_fwd ?? r.livePrice?.premium_fwd ?? null;
+    if (ovrUsd != null) premOverride += q * ovrUsd;
   }
-  return { premLive, premOverride, greeks, notional, hasOverride };
+  return { premLive, premOverride, bpsLive, greeks, hasOverride };
 }
 
 function TotalsRow({ totals, showOverridePrice, taker, greekColumns }: {
   totals: Totals; taker: boolean;
   showOverridePrice: boolean; greekColumns: GreekColId[];
 }) {
-  // Bps against package notional (Σ|q|·F). Degenerate when notional is 0 —
-  // show — rather than NaN. The bps shown next to TOTAL matches whichever
-  // price source is feeding $LIVE: in taker mode that's the leg fills, in
-  // mark mode it's the model theoreticals.
-  const liveBps = totals.notional > 0 ? (totals.premLive / totals.notional) * 10000 : null;
-  const ovrBps = totals.notional > 0 ? (totals.premOverride / totals.notional) * 10000 : null;
   return (
     <tr style={{
       borderTop: '2px solid var(--border)',
@@ -1073,11 +1087,11 @@ function TotalsRow({ totals, showOverridePrice, taker, greekColumns }: {
         style={taker ? { color: 'var(--accent)' } : undefined}>
         {fmt(totals.premLive, 2)}
       </Td>
-      <Td title="Package premium as bps of |q|·F notional">
-        {fmt(liveBps, 1)}
+      <Td title="Σ q · (premium / F) · 1e4 — signed sum of per-leg bps so the totals reconcile with reading the column top-down">
+        {fmt(totals.bpsLive, 1)}
       </Td>
       {showOverridePrice && (
-        <Td title={ovrBps != null ? `${ovrBps.toFixed(1)} bps of notional` : ''}>
+        <Td title="Package $ with overrides applied (signed)">
           {totals.hasOverride ? fmt(totals.premOverride, 2) : <span style={{ color: 'var(--fg-mute)' }}>—</span>}
         </Td>
       )}
