@@ -2,7 +2,7 @@
 
 ## Goal
 
-A local web app for screening Deribit options: live chain views, live and stale-fit SABR smiles, click-through historical detail, and a flexible widget-based dashboard. Multi-monitor friendly (Bloomberg-style popouts). Single-user, runs on the local machine.
+A local web app for screening Deribit options: live chain views, live SABR smiles with a frozen historic-fit overlay, click-through historical detail, multi-leg quick pricing, and a flexible widget-based dashboard. Multi-monitor friendly (Bloomberg-style popouts). Single-user, runs on the local machine.
 
 ## Hard constraints
 
@@ -110,7 +110,7 @@ M4.5's startup backfill is the biggest rate-limit risk in the app. Mitigations:
 Mapped from [HRTWorker article](https://www.hudsonrivertrading.com/hrtbeat/hrtworker-a-sharedworker-framework/).
 
 1. **One oracle, many clients.** Tabs never hit FastAPI directly — always through the SharedWorker.
-2. **Dual-mode service classes.** Each service (`ChainService`, `HistoryService`, `StaleFitService`, ...) has one class with two modes; oracle-mode runs the impl, client-mode is a transparent proxy returning AsyncGenerators. Same import, same call site.
+2. **Dual-mode service classes.** Each service (`ChainService`, `SmileService`, `HistoryService`, `BusService`, ...) has one class with two modes; oracle-mode runs the impl, client-mode is a transparent proxy returning AsyncGenerators. Same import, same call site.
 3. **Conversations, not RPC.** Methods are `async function*`; clients consume with `for await...of`. Cancellation propagates back up to oracle.
 4. **Structured-clone-safe payloads only.** Plain objects, no class instances or methods crossing the port.
 5. **Graceful degradation.** Detect SharedWorker support at boot; fall back to DedicatedWorker (or main thread) with the same class API.
@@ -164,8 +164,8 @@ Adding a widget = registering one entry. Each widget instance is an independent 
 | Widget | Config | Notes |
 |---|---|---|
 | `ChainTable` | `{venue, symbol, expiry, columns[]}` | Virtualized scroll. Toggleable cols: mid$, mid₿, IV, spread bps, spread $, OI, Δ, Γ, ν, residual-vs-SABR. **Bid/ask sizes intentionally not in the default set** (book_summary doesn't return them — see data strategy). |
-| `SmileChart` | `{venue, symbol, expiry, mode: 'live' \| 'staleFit', intervalMin?}` | Two modes in one component. |
-| `SmileGrid` | `{venue, symbol, mode}` | Small-multiples of all expiries. |
+| `SmileChart` | `{venue, symbol, expiry}` | Live-fit SABR curve + market dots, plus optional frozen historic-fit overlay (user-pinned timestamp from the 24h `HistoryStore`). |
+| `SmileGrid` | `{venue, symbol}` | Small-multiples of all expiries. M5. |
 | `SurfaceHeatmap` | `{venue, symbol}` | (T, log-moneyness) heatmap. |
 | `Pricer` | `{venue, symbol, expiry, strike, side, qty}` | Live SABR params → `BSMerton`; scenario shifters (Δspot, Δσ, Δt). |
 | `ForwardCurve` | `{venue, symbol}` | Futures term structure + basis vs perp. |
@@ -183,15 +183,11 @@ Adding a widget = registering one entry. Each widget instance is an independent 
 
 ## Smile views
 
-Two distinct smile widgets — keep both.
+`SmileChart` runs in **live-fit** mode: SABR fitted on every chain snapshot, curve and dots move together. Multiple widgets on the same `(currency, expiry)` share one upstream fit via the oracle's `acquireSharedStream` refcount (HRT principle 1) — 10 tabs still produce one `SABR.SABRfit` per expiry per snapshot.
 
-**Live-fit (`mode: 'live'`):** SABR fitted on every chain snapshot. Curve and dots move together.
+The "frozen curve, drifting dots" view that an earlier draft of this plan called *stale-fit* is already covered by the M3+ frozen historic-fit overlay: `historic_smile_fit(currency, expiry, as_of_ms)` snaps to the closest sample in the 24h `HistoryStore` and runs one fit; the frontend overlays the frozen curve dashed behind the live one. User-pinned timestamp instead of a wall-clock cadence — captures the same analytical signal (gap between fixed reference and live dots = vol has moved) without a dedicated cadence service. A "snap to most recent N-min boundary" auto-advance toggle on `SmileChart` is a small future enhancement that would re-add the cadence behaviour without standing up a new oracle service; not currently scheduled.
 
-**Stale-fit (`mode: 'staleFit'`):** SABR fitted every N minutes, **wall-clock-aligned** (e.g. fits at :00, :05, :10 for N=5). Curve frozen between fits; live bid/ask/mark dots overlaid. Label: "fit @ HH:MM:SS · Xm Ys ago." The point of this view is the gap — dots drifting off the frozen curve = vol has moved since the last fit.
-
-Implementation: new oracle-mode `StaleFitService` subscribes to the same chain feed `ChainService` produces, ignores all snapshots except every N min, runs `SABR.SABRfit` on those, caches `{expiry, fitTimestamp, alpha, rho, volvol, beta, fittedCurve}`. Tabs subscribe with `staleFitService.subscribe(instrument, intervalMin)` → AsyncGenerator yielding new fits or heartbeats.
-
-Multi-tab payoff: 10 tabs of stale-fit smiles still produce **one** fit per expiry per N min total.
+`SmileGrid` (small-multiples of all expiries) lands in M5 — a thin wrapper around `smileService`, no new oracle service needed.
 
 ## Analysis Mode
 
@@ -242,7 +238,6 @@ deribit smile stuff/
         │   ├── remoteExecute.ts      # decorator
         │   ├── transport.ts          # MessagePort framing
         │   ├── chainService.ts       # dual-mode
-        │   ├── staleFitService.ts    # dual-mode
         │   ├── historyService.ts     # dual-mode: subscribes to backend M2.5 data layer (series + trades + helpers)
         │   ├── analysisService.ts    # dual-mode: reads historyService, adds bucketed SABR fits + decay decomposition
         │   └── oracle.ts             # SharedWorker entrypoint
@@ -324,12 +319,123 @@ deribit smile stuff/
    - Dropped the previously-defined-but-unused `DeribitAdapter.latest_snapshot` and `refresh_book_summaries` (also from `VenueAdapter`). Every chain consumer is now strictly a `chain_stream` subscriber, no out-of-band reads.
    - Browser-verified end-to-end: BTC and ETH expiry dropdowns populate from `/api/chain/expiries`, chain rebuild renders the mirrored grid with ITM shading and tick flashes (502 animations across 56 mark cells over three polls verified in DevTools), SABR fit refreshes every 2 s in lockstep with the chain poll, snapshot timestamp ticks 10:51:29 → 10:51:31 → 10:51:33, and currency / expiry switches reset the chain cleanly without stale state bleeding through. Historic-fit overlay populates within ~200 ms of toggling on, frozen curve persists through subsequent live polls, as-of override + reset round-trips cleanly.
    - **Theming pass (post-M3 sub-task).** Two palettes specified in [COLOR_PALETTE.md](COLOR_PALETTE.md): dark (deep blue-black ground, near-white fg, blue accent, magenta-red `--neg` so it doesn't compete with `--bid`) and light (cool gray paper, true blue accent, desaturated red bid). Single set of CSS custom properties on `:root[data-theme]`; every component now reads from these tokens — no hex/rgb literals outside the theme file other than per-symbol identity colours (BTC orange, ETH purple, Notes grey). Fonts switched to `Inter` (chrome) + `Commit Mono` (data) with `JetBrains Mono` / `ui-monospace` fallbacks. Toggle button (`☾ dark` / `☀ light`) lives next to the StatusPill in the shell header; persists in `localStorage` under `deribit-smile:theme`. An inline `<script>` in `index.html` reads the stored value before paint to avoid a flash of the wrong palette on reload. Theme state lives in a single `ThemeProvider` context so all components re-render together. Dockview's theme is set via the `theme={themeLight | themeAbyss}` prop — passing a className on `DockviewReact` accumulates classes across renders, but the `theme` prop swaps cleanly. ChainTable's per-cell tick-flash colours read `--flash-up` / `--flash-down` from `getComputedStyle` at the moment of the flash so they adapt to the active theme without a re-render. Browser-verified: body bg switches `rgb(7,10,16)` ↔ `rgb(244,246,250)`, dv-groupview switches `rgb(0,12,24)` ↔ `rgb(255,255,255)`, currency-identity accents persist across modes, no console errors.
-5. **M3.5 — Stale-fit smile.** `SmileChart` stale-fit mode with wall-clock-aligned interval; `SmileGrid` small-multiples. New `StaleFitService` in oracle.
+5. **M3.5 — Quick Pricer + cross-widget bus.** ✅ **Complete (2026-04-30).** Delivered:
+   - `worker/busService.ts` — first cross-widget interaction primitive. Generic `busPublish(topic, payload)` / `busSubscribe(topic)` (fire-and-forget, no replay) plus a presence channel for the QuickPricer singleton (`registerQuickPricer(instanceId)` returning a release fn, `quickPricerStatusStream()` for late-mount replay). Topic catalog as a const object so consumers don't drift on strings — currently one topic, `quickPricer.addLeg`, with signed `side: ±1` qty 1; signed-add covers what an explicit `removeLeg` topic would have done. Oracle-side state (subscribers Set per topic, open instance Set, status listener Set) lives entirely in the oracle context per HRT principle 1; tabs are pure clients. **Refcount-vs-replay quirk fixed twice in the design:**
+     - `quickPricerRegister`/`Unregister` are split into two one-shot service calls instead of "one suspended-await conversation": `acquireSharedStream`'s abort signal can't break a forever-await inside a factory generator, so closing the QuickPricer panel via the dock tab × leaked the registration forever in the suspended-await design. Each call carries a unique `_tag` to defeat the oracle's refcount dedup so rapid mount/unmount/mount cycles (StrictMode) don't collapse into one.
+     - `quickPricerStatusStream()` also tags each call uniquely so a second `useQuickPricerOpen` subscriber (e.g. a second ChainTable that mounts after a pricer is already open) gets its own factory invocation and the "replay current state on subscribe" push fires for it. Without the tag, late subscribers got dedup'd onto the first stream and sat forever on the stale `false` default until the next change — visible bug: only the first chain's +/− buttons were enabled when multiple chains were open.
+   - `shared/black76.ts` — frontend Black-76 pricer + greeks (Δ, Γ, ν, Θ in forward-space) using A&S 7.1.26 erf, plus a `sabrLognormalVol` Hagan-2002 lognormal expansion (β-general, defaults to β=1 to match Deribit). Math runs entirely client-side; backend stays the single Deribit subscriber.
+   - `widgets/QuickPricer.tsx` — singleton multi-leg package pricer. Receives leg events from `ChainTable`'s +/− buttons via `busSubscribe(Topics.quickPricerAddLeg)`; signed-adds 1 to the matched leg's quantity, drops the leg when it nets to 0. Per-leg row carries: leg label + remove ×, signed qty (− 1 + stepper + direct edit), four override slots (vol, fwd, spot, fwd-rate) each with an active checkbox + value (greys when off, value preserved across toggles), four read-only live cells, `$LIVE` USD premium, `bps` of forward, optional `$OVR` column when any override is active, and a configurable greek panel. Two-of-three coupling on (spot, fwd, fwdRate): activating a third auto-deactivates the least-recently-touched of the others (`F = S · exp(r · T)` solves the third). Live mode sources vol from `mark_iv` per chain row; interpolated mode samples it from the live SABR fit at the leg's strike with mark_iv fallback. Taker mode swaps `$LIVE` from "Black-76 at mark IV" to the screen fill (long crosses ask, short hits bid) so the column reads realised premium; `bps` follows whichever price source is showing. Greeks always live (overrides freeze SOME inputs, others still tick — taker doesn't re-derive greeks because that'd need an implied-vol solve and risk reports off mark IV anyway). Per-unit toggle normalises totals to "1 unit of the package" using `min(|qty_i|)` as denominator. Bps against package notional `Σ|qty_i|·F_i` so delta-neutral packages don't divide by zero.
+   - **Greek column picker.** `GREEK_COL_DEFS` is a single source of truth for all eight column variants (base + dollar for each of Δ, Γ, ν, Θ): label + tooltip describing units (`Base delta = ∂P/∂F  (dimensionless ≈ coin-equivalent per 1 contract)`, `Dollar gamma = Γ · F²  ($ change in $Δ per 100% spot move)`, etc.), display decimals, and a `legValue(greeks, fwd)` function that pulls out the right scaling. The toolbar's `greeks…` button toggles a `GreekPicker` row of eight checkboxes in canonical order. Default columns: `Δ` (base, the trader's coin-delta intuition is the quickest read), `Γ$`, `ν$`, `Θ$/d` (dollar versions are the P&L-impact quantities desks risk-manage off). Picker also has a `default` reset button. Order in the table follows `GREEK_COL_ORDER` regardless of click order — keeps Δ/Γ/ν/Θ visually grouped even after odd subsets.
+   - `ChainTable` integration: each option row's bid/ask cells render a `+` / `−` chevron pinned to the cell edge that *faces the MARK column* (so every row reads `bid − mark + ask` regardless of side — calls and puts mirror correctly because the rule depends only on action direction, not row side). Cell padding flips on the same edge so the right-aligned price never collides with the chevron. Both coin- and USD-denominated bid/ask carry the buttons so users on either preset see the same controls. Buttons are gated on `useQuickPricerOpen()` — disabled with a tooltip when no pricer is mounted; re-enable on mount via the presence stream.
+   - `Num` rendering tweaked for sub-1 magnitudes: trailing zeros after a significant digit render in primary, not mute, so a bps-mode price like `0.0030` reads as "30 bps" rather than visually shrinking to "3 bps". Genuine zeros (`0.0000`) keep all-mute trailing.
+   - `widget` widths adjusted so 4-decimal coin prices ("0.xxxx") fit alongside the 18px chevron padding without clipping (bid/ask/mark/mid bumped from 60/62 → 72px).
+   - `useQuickPricerOpen()` hook in `hooks/useQuickPricer.ts` exposes the presence flag for any consumer that wants to gate behaviour on the pricer being mounted.
+   - Config v3 with migrator that injects safe defaults for missing fields (`taker: false`, `greekColumns: DEFAULT_GREEK_COLS`); legacy v1/v2 configs preserve their saved legs, mode, and per-unit toggle. Override slot values persist across `active: false` so re-enabling restores the typed number without retyping.
+   - Browser-verified end-to-end: + on ask of `BTC-30MAY26-90000-C` adds a long leg, repeated clicks stack qty, − on bid lifts qty toward 0 and drops the row; multiple chains all dispatch correctly (regression for the multi-chain bus bug); taker toggle visibly swaps `$LIVE` per-leg and total, accent-tinted; greek picker toggles live, totals re-aggregate per-leg using each leg's own forward; default reset returns to `Δ Γ$ ν$ Θ$/d` exactly. No console errors after the hygiene pass (LegButton `cellSide` prop dropped, `TotalsRow` `perUnit` dropped, `fireOneShot` rejection-safe, dead `quickPricerRemoveLeg` topic removed).
 6. **M4 — Click-through.** `InstrumentDetail` widget for quick-look. `ChainTable` row-click opens it as a new dock panel (with "pop out" button). Trade-IV history chart and spread ring buffer chart both read from the M2.5 data layer — no extra Deribit calls beyond the one new `public/ticker` poll for the open instrument.
 7. **M4.5 — Analysis Mode.** `AnalysisService` in oracle computes analysis-specific derivatives on top of the M2.5 data layer: bucketed SABR fits per time window (`fitHistory`), `greeksHistory` from historical fit + spot, `decayDecomposition` (theoretical θ vs actual P&L). Six analysis widgets. Layout-template-with-parameter-binding mechanism in the shell. "Open Analysis" action on `ChainTable` and `InstrumentDetail` spawns a tab group bound to the clicked instrument.
-7. **M5 — Surface, forwards, DVOL, pricer.** `SurfaceHeatmap`, `ForwardCurve`, `DvolPanel`, `Pricer`.
-8. **M6 — Bloomberg.** Bloomberg `VenueAdapter` via `xbbg`. `IbitArb` and `EthaArb` cross-venue widgets. Bloomberg also fills the spot-index gap deferred in M2.5: subscribes to `XBTUSD Curncy` / `XETUSD Curncy` and writes per-currency `spot` aggregates into the same `HistoryStore`, unlocking ETF↔synthetic basis math and (optionally) sharper decay decomposition in M4.5.
-9. **M7 — Open-ended.** Additional venues (OKX, Bybit, Paradigm) as adapters; existing widgets pick them up automatically.
+8. **M5 — Surface, forwards, DVOL, pricer, smile grid.** `SurfaceHeatmap`, `ForwardCurve`, `DvolPanel`, `SmileGrid` (small-multiples of all expiries; thin wrapper around `smileService`, no new oracle service needed), `Pricer` (the "full" pricer — multi-leg with strategy templates, scenario sliders, P&L diagrams; the M3.5 Quick Pricer is the input-shaping precursor).
+9. **M6 — Bloomberg.** Bloomberg `VenueAdapter` via `xbbg`. `IbitArb` and `EthaArb` cross-venue widgets. Bloomberg also fills the spot-index gap deferred in M2.5: subscribes to `XBTUSD Curncy` / `XETUSD Curncy` and writes per-currency `spot` aggregates into the same `HistoryStore`, unlocking ETF↔synthetic basis math and (optionally) sharper decay decomposition in M4.5.
+10. **M7 — Open-ended.** Additional venues (OKX, Bybit, Paradigm) as adapters; existing widgets pick them up automatically.
+
+## M3.5 — Quick Pricer
+
+A single-instance, multi-leg package pricer that takes its leg list from `ChainTable` (and any future widget that wants to publish trades). Designed as a focused input-shaping tool, not the full M5 pricer — fewer modes, no P&L diagrams, no strategy templates. The M5 `Pricer` will be the larger, persistent, multi-instance follow-up.
+
+### Cross-widget primitive: `busService`
+
+First widget-to-widget interaction in the app, so the primitive is general — not Quick-Pricer-specific.
+
+- New dual-mode service `busService` in the oracle (HRT principles 1, 4, 6 apply: structured-clone-safe payloads, conversation-id'd subscriptions, drop on widget unmount).
+- Surface:
+  - `publish(topic, payload)` — fire-and-forget event.
+  - `subscribe(topic) → AsyncGenerator<event>` — events from the moment subscription opens (no replay).
+- Topic naming convention: `<consumer>.<verb>.<scope>`. M4.75 uses exactly two topics:
+  - `quickPricer.addLeg` — payload `{ venue, instrumentName, side: 1 | -1, qty: 1 }` (qty is always 1 per click; the pricer stacks repeated clicks into the leg's quantity, see §4 below).
+  - `quickPricer.removeLeg` — payload `{ venue, instrumentName, side: 1 | -1, qty: 1 }`. Mirror of `addLeg` — decrements; if the resulting quantity is zero the leg is dropped.
+- Singleton enforcement: oracle tracks open Quick Pricer instances by a registration message on the bus; the widget shell's "+ Quick Pricer" registry entry is gated so only one can be open at a time. Header button greys out when one exists; closing the panel re-enables it. (Multi-instance pricing is the M5 `Pricer`'s job.)
+- Bus events go nowhere if no Quick Pricer is open — clicking a chain button with no pricer mounted is a silent no-op (consider a one-shot toast "Open Quick Pricer to receive legs" later if it's confusing in practice).
+
+### `ChainTable` integration
+
+- Two new per-row controls in `ChainTable`: small `+` (buy / +1) and `−` (sell / −1) buttons, one each on the bid and ask side of every option row. Clicking publishes `quickPricer.addLeg` for that instrument.
+- `+` on the ask = buy 1, `−` on the bid = sell 1. Matches the visual convention where the user is "lifting offers" or "hitting bids."
+- Repeated clicks stack into the leg's quantity (handled by the pricer; see §4). `+` then `−` on the same leg cancels out via `removeLeg`.
+- Buttons are visually subtle (small chevrons in `--fg-mute`, hover-only background) so they don't fight the existing tick-flash and ITM-shading layers.
+- Buttons are gated on `is a Quick Pricer open?` — when none is open, they render disabled with a tooltip pointing to the header button.
+
+### `QuickPricer` widget
+
+Layout: a compact table — one row per leg, plus a totals row. Header carries the global controls. Singleton (only one instance at a time, per §busService).
+
+#### Header controls (apply to all legs)
+
+- **Mode toggle** — single checkbox `interpolated`:
+  - **off (default)**: each leg's vol is the chain's quoted `mark_iv` for that exact strike (the "screen" / non-interpolated mode).
+  - **on**: each leg's vol is sampled from the live SABR curve at the leg's strike (interpolated). Sourced from `smileService.smileStream(currency, expiry)` — already a shared computation per HRT principle, so multiple legs on the same expiry hit one fit.
+- **Per-unit / per-package toggle** — checkbox `perUnit`:
+  - **off**: P&L columns (premium, $-greeks) show the *package* value, summed across legs with sign and quantity.
+  - **on**: columns are normalised to "1 unit of the package" using the **smallest-leg quantity as the denominator**. E.g. a `100×200` call spread (long 100, short 200) shows as `1×2` (long 1, short 2 per unit). Implementation: `unitDenominator = min(|qty_i|)` across legs; per-unit values = package values / `unitDenominator`. Single-leg packages: per-unit and per-package are identical, but the toggle is still respected for display consistency.
+- **Clear all** button (drops all legs).
+
+#### Per-leg row
+
+Columns left-to-right:
+
+1. **Leg label** — `BTC-30MAY25-90000-C` style. Trailing `×` removes the leg.
+2. **Side / qty** — signed integer entry. `+` button increments, `−` button decrements (so an external chain click and a manual click are the same op). Direct numeric edit allowed; sign denotes side. Reaching 0 drops the leg.
+3. **Vol override** — numeric input + adjacent `useOverride` checkbox. Disabling the checkbox **greys** the input but **preserves the value** (re-enabling restores it without retyping). When the checkbox is unchecked, the leg uses the live vol from the active mode (screen vs SABR).
+4. **Spot override** / **Forward override** / **Forward-rate override** — three inputs, each with a `useOverride` checkbox identical to vol's. **At most two of these three can be active at once**; the third auto-disables (and greys) because spot, forward, and forward-rate are linked via `F = S · exp(r · T)`. The widget computes the third from the other two — when the user toggles a third on, the *least recently changed* of the others auto-toggles off (last-touched stays).
+5. **Live vol / live spot / live fwd / live fwd rate** — four read-only display columns, one per overridable input, showing the *live* value sourced from the chain / smile / forward services regardless of override state. This makes "the price moved because vol moved" vs "because spot moved" legible at a glance — important per §requirement 4 (overrides freeze one input but the others still tick).
+6. **Live price (coin / $)** — what the leg costs *right now* using all live inputs (no overrides applied). Always shown.
+7. **Override price (coin / $)** — what the leg costs using the leg's overrides applied on top of remaining live inputs. Hidden if no overrides are active on this leg; visually distinguished (e.g. boxed) when shown.
+8. **Greeks (live)** — Δ, $Δ, Γ, $Γ, $ν, $Θ. Always live, recomputed every tick from current inputs (overrides + live). Per §requirement 4: greeks must keep ticking even on legs with overrides, because a vol override doesn't freeze spot and vice versa.
+
+`$` columns multiply by the leg's underlying spot in USD (matches `ChainTable`'s USD preset convention — each leg uses *its own* expiry's underlying so multi-expiry packages are correct).
+
+#### Totals row
+
+- Sum across legs of: live price ($, bps), override price ($, bps if applicable), Δ, $Δ, Γ, $Γ, $ν, $Θ.
+- Respects the `perUnit` toggle: when on, totals divide by `unitDenominator` per the rule above.
+- Bps is computed against the **package notional** = Σ |qty_i| · F_i (sum of absolute leg notionals at each leg's forward); avoids the degenerate `0` denominator that plain net-notional gives on a delta-neutral package.
+
+#### Math sourcing
+
+- All pricing/greeks via `BSMerton` from `sabr_greeks.py` (per the existing `Pricer` plan in M5 — same library, same conventions). Black-76 wrapper in `backend/iv.py` is already there from M3 if needed.
+- Live inputs (per leg per tick):
+  - **Spot / forward** — from `historyService` aggregates (`forward_opt:{expiry}` for option-implied F, `index` for spot), live-streamed.
+  - **Forward rate** — derived as `r = ln(F/S) / T`. Not a separate feed.
+  - **Vol** — screen mode: `mark_iv` from the active `chainStream`. SABR mode: evaluated from the active `smileStream`'s `{alpha, rho, volvol, beta}` at the leg's strike.
+- All four feeds are pre-existing oracle services; the pricer is purely a consumer + calculator. No new backend endpoints.
+
+### Config (persisted with layout)
+
+```ts
+type QuickPricerConfig = {
+  legs: Array<{
+    venue: string;            // 'deribit'
+    instrumentName: string;   // 'BTC-30MAY25-90000-C'
+    qty: number;              // signed; sign = side
+    overrides: {
+      vol?:     { value: number; active: boolean };
+      spot?:    { value: number; active: boolean };
+      fwd?:     { value: number; active: boolean };
+      fwdRate?: { value: number; active: boolean };
+    };
+  }>;
+  mode: 'screen' | 'interpolated';
+  perUnit: boolean;
+  configVersion: number;
+};
+```
+
+Override values persist in the saved profile even when `active: false` — re-enabling the checkbox restores the old number (per §requirement 2).
+
+### Open items (M4.75-specific)
+
+- Whether `removeLeg` from the chain (the `−` button on a row that already has a position in the pricer) should decrement, drop, or always net (e.g., does `−` on a leg I'm already long sell against the long, or just go shorter?). Default: signed-add — a `−` always adds `−1` to that leg's qty, so it nets. Multi-click on the bid side of an already-long leg gets you flat then short.
+- Whether the `+`/`−` buttons should be on every row regardless of pricer state (greyed) or only appear when a pricer is open. Lean: always-rendered + greyed, so layout doesn't shift on widget mount.
+- Bps denominator alternatives if `Σ|qty_i|·F_i` proves confusing (e.g., for vertical spreads where the sum over-counts). Could specialise per-strategy later.
 
 ## Defaults locked in
 
@@ -337,7 +443,7 @@ deribit smile stuff/
 - Data transport: **REST throughout, polled at 2s.** No WS in the production path. Sub-1s fidelity is a non-goal for this screener at every level (chain, per-instrument, forwards, trades).
 - Chain-level: `get_book_summary_by_currency` per currency every 2s. Sizes are *not* shown in `ChainTable` by default (require per-instrument calls — see [data strategy](#rate-limits--data-strategy)).
 - Per-instrument: `public/ticker` per open `InstrumentDetail` every 2s; `get_last_trades_by_instrument_and_time` delta-fetched at 2s for the trade-print panel.
-- Stale-fit cadence: default 5 min, wall-clock-aligned, configurable 1–30 min per widget instance.
+- Frozen historic-fit overlay: user-pinned timestamp from the 24h `HistoryStore`; default as-of is `(mount_time − 24h)` captured in a session-local ref (not persisted, since a stale absolute timestamp would sit outside the 24h buffer on next session).
 - History lookback: ~24h, fetched on demand from Deribit when `InstrumentDetail` opens.
 - Spread history: in-memory ring buffer, session-scoped, no disk; appended from each `public/ticker` poll while `InstrumentDetail` is open.
 - Currency color accents: BTC orange, ETH purple, SOL cyan, equity ETF white.

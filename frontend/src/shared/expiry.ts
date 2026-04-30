@@ -45,3 +45,24 @@ export function pickClosestExpiry(saved: string | null | undefined, list: string
 export function sortExpiries(tokens: Iterable<string>): string[] {
   return [...tokens].sort((a, b) => (parseExpiryMs(a) ?? Infinity) - (parseExpiryMs(b) ?? Infinity));
 }
+
+export interface ParsedInstrument {
+  currency: string;
+  expiry: string;
+  strike: number;
+  optionType: 'C' | 'P';
+}
+
+/** Parse a Deribit option instrument name like "BTC-30MAY25-90000-C" into its
+ *  parts. Returns null on malformed names — callers should treat that as a
+ *  hard error since instrument names come from the backend chain. */
+export function parseInstrument(name: string): ParsedInstrument | null {
+  const parts = name.split('-');
+  if (parts.length !== 4) return null;
+  const [currency, expiry, strikeStr, optType] = parts;
+  const strike = Number(strikeStr);
+  if (!Number.isFinite(strike) || strike <= 0) return null;
+  if (optType !== 'C' && optType !== 'P') return null;
+  if (parseExpiryMs(expiry) == null) return null;
+  return { currency, expiry, strike, optionType: optType };
+}

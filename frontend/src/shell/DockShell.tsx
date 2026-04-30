@@ -9,6 +9,7 @@ import 'dockview/dist/styles/dockview.css';
 
 import { StatusPill } from '../components/StatusPill';
 import { useTheme } from '../hooks/useTheme';
+import { useQuickPricerOpen } from '../hooks/useQuickPricer';
 import { getWidget, allWidgets } from './widgetRegistry';
 import {
   DEFAULT_PROFILE,
@@ -20,6 +21,7 @@ import {
 import '../widgets/Notes';
 import '../widgets/ChainTable';
 import '../widgets/SmileChart';
+import '../widgets/QuickPricer';
 
 // ---------- panel params ----------
 
@@ -298,6 +300,7 @@ function ShellHeader() {
     exportProfiles, importProfilesFromFile,
   } = useDockShell();
   const { theme, toggleTheme } = useTheme();
+  const pricerOpen = useQuickPricerOpen();
   const [savingAs, setSavingAs] = useState('');
   const [showSave, setShowSave] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -334,11 +337,23 @@ function ShellHeader() {
         {theme === 'dark' ? '☀ light' : '☾ dark'}
       </button>
       <Spacer />
-      {widgets.map(w => (
-        <button key={w.id} onClick={() => addPanel(w.id)} style={btnStyle}>
-          + {w.title}
-        </button>
-      ))}
+      {widgets.map(w => {
+        const isQuickPricer = w.id === 'quickPricer';
+        const disabled = isQuickPricer && pricerOpen;
+        return (
+          <button
+            key={w.id}
+            onClick={() => addPanel(w.id)}
+            disabled={disabled}
+            title={disabled ? 'Only one Quick Pricer can be open at a time' : `Add ${w.title}`}
+            style={{
+              ...btnStyle,
+              opacity: disabled ? 0.4 : 1,
+              cursor: disabled ? 'not-allowed' : 'pointer',
+            }}
+          >+ {w.title}</button>
+        );
+      })}
       <Divider />
       <button onClick={popoutActive} style={btnStyle} title="Pop out active panel">⇱ popout</button>
       <Divider />

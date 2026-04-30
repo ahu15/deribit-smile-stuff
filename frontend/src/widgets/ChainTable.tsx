@@ -2,6 +2,8 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { registerWidget, type WidgetProps } from '../shell/widgetRegistry';
 import { chainStream, fetchExpiries, type ChainRow, type ChainSnapshot } from '../worker/chainService';
 import { pickClosestExpiry, sortExpiries } from '../shared/expiry';
+import { busPublish, Topics, type AddLegEvent } from '../worker/busService';
+import { useQuickPricerOpen } from '../hooks/useQuickPricer';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Visual spec — Option Chain Visual Spec.md
@@ -31,8 +33,8 @@ type MetricId =
 // presets default to compact density to fit four numeric columns per side
 // without horizontal scroll on a typical dock.
 const PRESETS: Record<'dollar' | 'bps', { metrics: MetricId[]; density: RowDensity }> = {
-  dollar: { metrics: ['usd_bid', 'usd_ask', 'usd_mark', 'iv'], density: 'compact' },
-  bps:    { metrics: ['bid', 'ask', 'mark', 'iv'],             density: 'compact' },
+  dollar: { metrics: ['usd_bid', 'usd_mark', 'usd_ask', 'iv'], density: 'compact' },
+  bps:    { metrics: ['bid', 'mark', 'ask', 'iv'],             density: 'compact' },
 };
 
 type RowDensity = 'compact' | 'default' | 'comfortable';
@@ -48,9 +50,12 @@ interface ChainTableConfig {
 
 const ACCENT: Record<Currency, string> = { BTC: '#f7931a', ETH: '#8c8cf7' };
 
-// Default order: closest-to-spine = BID, ASK, MARK, IV, $BID, $ASK, Δ24h, OI.
+// Default puts-side order, spine-out: BID, MARK, ASK, IV, $BID, $MARK, $ASK, Δ24h, OI.
+// On the calls side, this is mirrored *and* bid/ask are swapped (see
+// `callMetricsOrder`) so reading globally left-to-right always shows
+// BID < MARK < ASK on each side — the standard option-chain convention.
 const DEFAULT_METRICS: MetricId[] = [
-  'bid', 'ask', 'mark', 'iv', 'usd_bid', 'usd_ask', 'change_24h', 'oi',
+  'bid', 'mark', 'ask', 'iv', 'usd_bid', 'usd_mark', 'usd_ask', 'change_24h', 'oi',
 ];
 
 const DEFAULT_CONFIG: ChainTableConfig = {
@@ -96,18 +101,23 @@ function Num({ value, decimals, percent, signed, color }: NumProps): JSX.Element
   const dim = 'var(--fg-dim)';
   const mute = 'var(--fg-mute)';
 
-  // Magnitude < 1 (e.g. 0.0035 BTC option marks): the leading "0." is just
-  // scaffolding — dim it. Bright the first non-zero digit through the last
-  // non-zero digit so the eye lands on the significant figures, not the "0".
+  // Magnitude < 1 (e.g. 0.0035 BTC option marks): the leading "0." plus any
+  // leading zeros are just magnitude scaffolding — dim them. Everything from
+  // the first non-zero digit onward (including trailing zeros) is real
+  // precision and must read brightly: in bps mode "0.0030" is "30 bps", and
+  // muting the trailing zero like we do for ≥1 values would visually shrink
+  // it to "3 bps". Only fully-zero values (0.0000) keep the muted trailing
+  // since there's no significant digit to anchor.
   if (intPart === '0' && (fracKept.length > 0 || trailingZeros.length > 0)) {
     const leading = fracKept.match(/^0+/)?.[0] ?? '';
     const significant = fracKept.slice(leading.length);
+    const trailingColor = significant.length > 0 ? primary : mute;
     return (
       <span style={{ fontVariantNumeric: 'tabular-nums', color: primary }}>
         {sign}
         <span style={{ color: mute }}>0.{leading}</span>
         {significant && <span style={{ color: primary }}>{significant}</span>}
-        {trailingZeros && <span style={{ color: mute }}>{trailingZeros}</span>}
+        {trailingZeros && <span style={{ color: trailingColor }}>{trailingZeros}</span>}
         {percent && <span style={{ color: mute }}>%</span>}
       </span>
     );
@@ -194,26 +204,30 @@ const USD_PRICE_EPSILON = 1e-2;
 const IV_EPSILON = 1e-3;
 
 const METRIC_DEFS: Record<MetricId, MetricDef> = {
+  // Coin-priced bid/ask/mark/mid render at 4 dp ("0.0035") which is ~40 px in
+  // 12-px tabular-nums. Widths must be ≥ 4 dp + decimal point + sign + the
+  // 18 px reserved for the leg-action chevron + 6 px right padding, so 72 px
+  // gives a comfortable margin without making the chain feel sparse.
   bid: {
-    id: 'bid', label: 'BID', width: 60, level: 'primary',
+    id: 'bid', label: 'BID', width: 72, level: 'primary',
     flashValue: r => r?.bid_price ?? null,
     flashEpsilon: COIN_PRICE_EPSILON,
     render: r => <Num value={r?.bid_price} decimals={4} color="var(--bid)" />,
   },
   ask: {
-    id: 'ask', label: 'ASK', width: 60, level: 'primary',
+    id: 'ask', label: 'ASK', width: 72, level: 'primary',
     flashValue: r => r?.ask_price ?? null,
     flashEpsilon: COIN_PRICE_EPSILON,
     render: r => <Num value={r?.ask_price} decimals={4} color="var(--ask)" />,
   },
   mark: {
-    id: 'mark', label: 'MARK', width: 62, level: 'primary',
+    id: 'mark', label: 'MARK', width: 72, level: 'primary',
     flashValue: r => r?.mark_price ?? null,
     flashEpsilon: COIN_PRICE_EPSILON,
     render: r => <Num value={r?.mark_price} decimals={4} />,
   },
   mid: {
-    id: 'mid', label: 'MID', width: 62, level: 'primary',
+    id: 'mid', label: 'MID', width: 72, level: 'primary',
     flashValue: r => r?.mid_price ?? null,
     flashEpsilon: COIN_PRICE_EPSILON,
     render: r => <Num value={r?.mid_price} decimals={4} />,
@@ -304,6 +318,12 @@ const FONT_SIZE: Record<'primary' | 'secondary' | 'tertiary', number> = {
 function bps(r: ChainRow | null): number | null {
   if (!r || r.spread == null || r.mid_price == null || r.mid_price <= 0) return null;
   return (r.spread / r.mid_price) * 10000;
+}
+
+function swapByIdInPlace(arr: MetricDef[], a: MetricId, b: MetricId): void {
+  const i = arr.findIndex(m => m.id === a);
+  const j = arr.findIndex(m => m.id === b);
+  if (i >= 0 && j >= 0) [arr[i], arr[j]] = [arr[j], arr[i]];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -397,6 +417,7 @@ function ChainTable({ config, onConfigChange }: WidgetProps<ChainTableConfig>) {
 
   const accent = ACCENT[config.symbol];
   const rowH = ROW_HEIGHT[config.density];
+  const pricerOpen = useQuickPricerOpen();
 
   // Index of the first row with strike >= F. Spot line draws between i-1 and i.
   const spotIdx = useMemo(() => {
@@ -456,6 +477,7 @@ function ChainTable({ config, onConfigChange }: WidgetProps<ChainTableConfig>) {
           spotIdx={spotIdx}
           rowH={rowH}
           accent={accent}
+          pricerOpen={pricerOpen}
         />
       )}
     </div>
@@ -605,9 +627,10 @@ interface MirrorProps {
   spotIdx: number;
   rowH: number;
   accent: string;
+  pricerOpen: boolean;
 }
 
-function Mirror({ rows, metrics, forward, spotIdx, rowH, accent }: MirrorProps) {
+function Mirror({ rows, metrics, forward, spotIdx, rowH, accent, pricerOpen }: MirrorProps) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportH, setViewportH] = useState(0);
@@ -640,8 +663,17 @@ function Mirror({ rows, metrics, forward, spotIdx, rowH, accent }: MirrorProps) 
   const padBottom = (total - end) * rowH;
   const visible = rows.slice(start, end);
 
-  // Calls side mirrors puts side: same metrics, far-from-spine first.
-  const callMetrics = [...metrics].reverse();
+  // Calls side mirrors puts side, but bid/ask are swapped so the global
+  // left-to-right read shows BID < MARK < ASK on both sides (standard
+  // option-chain convention — bid is always to the left of ask). Without
+  // the swap, mirroring would put BID closest to spine on calls *and*
+  // closest on puts, which means calls reads ASK < MARK < BID — wrong.
+  const callMetrics = useMemo(() => {
+    const reversed = metrics.slice().reverse();
+    swapByIdInPlace(reversed, 'bid', 'ask');
+    swapByIdInPlace(reversed, 'usd_bid', 'usd_ask');
+    return reversed;
+  }, [metrics]);
 
   const sideWidth = metrics.reduce((s, m) => s + m.width, 0);
   const totalWidth = sideWidth * 2 + STRIKE_WIDTH;
@@ -670,6 +702,7 @@ function Mirror({ rows, metrics, forward, spotIdx, rowH, accent }: MirrorProps) 
                   forward={forward}
                   rowH={rowH}
                   isAtm={spotIdx >= 0 && (idx === spotIdx - 1 || idx === spotIdx)}
+                  pricerOpen={pricerOpen}
                 />
               );
             })}
@@ -739,9 +772,10 @@ interface RowProps {
   forward: number | null;
   rowH: number;
   isAtm: boolean;
+  pricerOpen: boolean;
 }
 
-function Row({ pair, callMetrics, putMetrics, forward, rowH, isAtm }: RowProps) {
+function Row({ pair, callMetrics, putMetrics, forward, rowH, isAtm, pricerOpen }: RowProps) {
   const callItm = forward != null && pair.strike < forward;
   const putItm = forward != null && pair.strike > forward;
 
@@ -757,12 +791,14 @@ function Row({ pair, callMetrics, putMetrics, forward, rowH, isAtm }: RowProps) 
       {callMetrics.map(m => (
         <Cell
           key={`c-${m.id}`} m={m} row={pair.call} itm={callItm}
+          side="call" pricerOpen={pricerOpen}
         />
       ))}
       <StrikeCell strike={pair.strike} isAtm={isAtm} />
       {putMetrics.map(m => (
         <Cell
           key={`p-${m.id}`} m={m} row={pair.put} itm={putItm}
+          side="put" pricerOpen={pricerOpen}
         />
       ))}
     </div>
@@ -792,7 +828,9 @@ function formatStrike(s: number): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Cell — the only place where tick flashes are wired.
+// Cell — the only place where tick flashes are wired, and where the leg-action
+// chevron is anchored. Cell padding flips per action direction so the chevron
+// always sits on the cell edge that abuts the MARK column (see LegButton).
 // On every render where flashValue() differs from the previous mounted value,
 // fire a 700 ms background fade. First mount sets the baseline; no flash then.
 //
@@ -812,9 +850,22 @@ interface CellProps {
   m: MetricDef;
   row: ChainRow | null;
   itm: boolean;
+  side: 'call' | 'put';
+  pricerOpen: boolean;
 }
 
-function Cell({ m, row, itm }: CellProps) {
+// Map metric ids to leg action verbs. Both coin- and USD-denominated bid/ask
+// carry the +/− buttons so the pair always brackets the mark column regardless
+// of which preset (bps or dollar) the user picked. If both pairs are visible
+// at once the user gets two buttons per side — that's redundant but not buggy:
+// each click dispatches the same add-leg action.
+function legAction(metricId: MetricId): 1 | -1 | null {
+  if (metricId === 'bid' || metricId === 'usd_bid') return -1;   // hit the bid → sell 1
+  if (metricId === 'ask' || metricId === 'usd_ask') return +1;   // lift the ask → buy 1
+  return null;
+}
+
+function Cell({ m, row, itm, side, pricerOpen }: CellProps) {
   const ref = useRef<HTMLDivElement>(null);
   const prev = useRef<number | null>(null);
   const value = m.flashValue(row);
@@ -849,19 +900,96 @@ function Cell({ m, row, itm }: CellProps) {
     prev.current = value;
   }, [value, m.flashEpsilon, itm]);
 
+  const action = row ? legAction(m.id) : null;
+
+  // Pin the chevron to the edge of the cell that faces the MARK column so the
+  // visual reads `bid − mark + ask` regardless of which side of the spine the
+  // cell is on. Sell (−) sits on the bid's right edge (which abuts mark); buy
+  // (+) sits on the ask's left edge (which also abuts mark). Reserve extra
+  // padding on that same edge so the right-aligned number never collides with
+  // the chevron.
+  const buttonOnLeft = action === +1;
+  const buttonOnRight = action === -1;
+
   return (
     <div
       ref={ref}
       style={{
-        width: m.width, padding: '0 6px',
+        width: m.width,
+        paddingLeft: buttonOnLeft ? 18 : 6,
+        paddingRight: buttonOnRight ? 18 : 6,
         textAlign: 'right',
         fontSize: FONT_SIZE[m.level],
         background: itm ? 'var(--itm)' : undefined,
         whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+        position: 'relative',
       }}
     >
+      {action !== null && row && (
+        <LegButton row={row} side={action} enabled={pricerOpen} />
+      )}
       {m.render(row)}
     </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LegButton — chain row's leg-add control. Pinned to the cell edge facing the
+// MARK column so every row reads `bid − mark + ask` regardless of side: − on
+// the bid's mark-facing edge, + on the ask's mark-facing edge. The Cell
+// wrapper reserves matching padding on the same edge so the right-aligned
+// price never sits underneath the glyph.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function LegButton({
+  row, side, enabled,
+}: { row: ChainRow; side: 1 | -1; enabled: boolean }) {
+  const edge = side === +1 ? { left: 1 } : { right: 1 };
+  const glyph = side === 1 ? '+' : '−';
+  const title = enabled
+    ? (side === 1 ? `Buy 1 ${row.instrument_name}` : `Sell 1 ${row.instrument_name}`)
+    : 'Open Quick Pricer to add legs';
+
+  const onClick = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!enabled) return;
+    busPublish(Topics.quickPricerAddLeg, {
+      venue: 'deribit', instrumentName: row.instrument_name, side, qty: 1,
+    } satisfies AddLegEvent).catch(() => { /* best-effort */ });
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={!enabled}
+      title={title}
+      style={{
+        position: 'absolute', top: '50%', transform: 'translateY(-50%)',
+        ...edge,
+        width: 13, height: 13, padding: 0, lineHeight: '11px',
+        border: '1px solid transparent',
+        background: 'transparent',
+        color: enabled ? 'var(--fg-mute)' : 'var(--bg-2)',
+        fontSize: 12, fontFamily: 'var(--font-data)', fontWeight: 600,
+        cursor: enabled ? 'pointer' : 'not-allowed',
+        borderRadius: 2,
+        opacity: enabled ? 0.85 : 0.5,
+      }}
+      onMouseEnter={e => {
+        if (!enabled) return;
+        const t = e.currentTarget;
+        t.style.background = 'var(--bg-2)';
+        t.style.color = side === 1 ? 'var(--ask)' : 'var(--bid)';
+        t.style.opacity = '1';
+      }}
+      onMouseLeave={e => {
+        const t = e.currentTarget;
+        t.style.background = 'transparent';
+        t.style.color = enabled ? 'var(--fg-mute)' : 'var(--bg-2)';
+        t.style.opacity = enabled ? '0.85' : '0.5';
+      }}
+    >{glyph}</button>
   );
 }
 
