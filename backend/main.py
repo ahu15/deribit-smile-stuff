@@ -14,8 +14,8 @@ load_dotenv()
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 
+from backend.calibration import FitResult, get_calibrator, list_methodologies
 from backend.chain import ChainRow
-from backend.fit import FitResult
 from backend.history import HistoryStore, Sample, TradePrint
 from backend.venues.deribit.adapter import DeribitAdapter
 from backend.venues import registry
@@ -83,14 +83,25 @@ async def put_calendar(payload: dict):
     }
 
 
+@app.get("/api/methodologies")
+async def get_methodologies():
+    """Catalog of registered smile-calibration methodologies (M3.7).
+
+    One-shot — the catalog is build-time-constant. Frontend fetches once at
+    oracle boot via `worker/methodologyService.ts` and refcount-shares
+    across all tabs.
+    """
+    return {"methodologies": [dataclasses.asdict(m) for m in list_methodologies()]}
+
+
 @app.post("/api/calendar/recalibrate")
 async def recalibrate_calendar():
     """Recompute every wkg-basis cached fit under the current calendar
-    revision. M3.6 ships the calendar plumbing; the bucketed fit cache that
-    actually has wkg-basis entries to recompute lands in M3.7/M3.9 — for now
-    this endpoint is a stub that reports a count of zero. The endpoint is
-    in place so the VolCalendar widget can wire the button without a
-    follow-up backend change later.
+    revision. The per-snapshot cache (M3.7) self-invalidates via its
+    `calendar_rev` cache key on the next chain poll, so live subscribers
+    pick up new fits within ~2 s without this endpoint doing anything.
+    The bucketed historic-fit cache that this endpoint will actually walk
+    lands in M3.9; until then the response reports a count of zero.
     """
     cal = vol_time.get_active_calendar()
     return {
@@ -126,14 +137,23 @@ async def chain_expiries(currency: str):
 
 
 @app.get("/api/smile/historic")
-async def smile_historic(currency: str, expiry: str, as_of_ms: int):
+async def smile_historic(
+    currency: str,
+    expiry: str,
+    as_of_ms: int,
+    methodology: str = "sabr-naive",
+    term_structure: str | None = None,
+):
     """One-shot historic SABR fit. Replays mark_iv from each instrument's
     HistoryStore series, snaps to the closest sample to `as_of_ms` (clamping
-    to the 24h buffer boundary), fits SABR, returns the frozen curve. The
-    frontend calls this once per as-of change and renders the result statically.
+    to the 24h buffer boundary), fits under the chosen methodology, returns
+    the frozen curve. The frontend calls this once per as-of change.
     """
     adapter: DeribitAdapter = registry.get("deribit")
-    res = adapter.historic_smile_fit(currency, expiry, as_of_ms)
+    res = adapter.historic_smile_fit(
+        currency, expiry, as_of_ms,
+        methodology=methodology, ts_method=term_structure,
+    )
     return {
         "currency": currency,
         "expiry": expiry,
@@ -142,6 +162,7 @@ async def smile_historic(currency: str, expiry: str, as_of_ms: int):
         "earliest_ms": res.earliest_ms,
         "latest_ms": res.latest_ms,
         "forward": res.forward,
+        "calendar_rev": vol_time.calendar_rev(vol_time.get_active_calendar()),
         "fit": _fit_dict(res.fit) if res.fit else None,
         "market_points": [{"strike": k, "iv": v} for k, v in res.market_points],
     }
@@ -444,18 +465,30 @@ def _row_dict(r: ChainRow) -> dict:
 
 
 def _fit_dict(fit: FitResult) -> dict:
+    """Wire format for FitResult (M3.7 tagged-union).
+
+    `params` is the per-kind bag (SABR: alpha/rho/volvol/beta). The frontend's
+    `frontend/src/calibration/<kind>.ts` evaluator reconstructs the smile
+    from these. `calendar_rev` rides on the envelope as well (see
+    `_subscribe_smile`) so a recalibrate is legible without opening the fit.
+    """
     return {
-        "alpha": fit.alpha,
-        "rho": fit.rho,
-        "volvol": fit.volvol,
-        "beta": fit.beta,
+        "kind": fit.kind,
+        "methodology": fit.methodology,
+        "params": dict(fit.params),
         "forward": fit.forward,
         "t_years": fit.t_years,
+        "t_years_cal": fit.t_years_cal,
+        "t_years_wkg": fit.t_years_wkg,
+        "calendar_rev": fit.calendar_rev,
         "strikes": fit.strikes,
         "fitted_iv": fit.fitted_iv,
         "market_strikes": fit.market_strikes,
         "market_iv": fit.market_iv,
+        "weights_used": fit.weights_used,
         "residual_rms": fit.residual_rms,
+        "weighted_residual_rms": fit.weighted_residual_rms,
+        "frozen": list(fit.frozen),
     }
 
 
@@ -500,6 +533,9 @@ async def _subscribe_smile(
 ) -> Callable[[], None]:
     currency = str(msg.get("currency") or "")
     expiry = str(msg.get("expiry") or "")
+    methodology = str(msg.get("methodology") or "sabr-naive")
+    raw_ts = msg.get("termStructure")
+    ts_method: str | None = str(raw_ts) if raw_ts else None
     if not currency or not expiry:
         await ws.send_text(json.dumps({
             "type": "error", "conversationId": conversation_id,
@@ -507,14 +543,33 @@ async def _subscribe_smile(
         }))
         return lambda: None
 
+    # Validate methodology + ts pairing up front so a typo fails loudly
+    # rather than silently emitting None forever.
+    calibrator = get_calibrator(methodology)
+    if calibrator is None:
+        await ws.send_text(json.dumps({
+            "type": "error", "conversationId": conversation_id,
+            "message": f"unknown methodology: {methodology}",
+        }))
+        return lambda: None
+    if calibrator.requires_ts and not ts_method:
+        await ws.send_text(json.dumps({
+            "type": "error", "conversationId": conversation_id,
+            "message": f"methodology {methodology} requires termStructure",
+        }))
+        return lambda: None
+
     async def pump() -> None:
         try:
             async for snap in adapter.chain_stream(currency):
-                fit = adapter.smile_fit(currency, expiry)
+                fit = adapter.smile_fit(currency, expiry, methodology, ts_method)
                 payload = {
                     "currency": currency,
                     "expiry": expiry,
+                    "methodology": methodology,
+                    "termStructure": ts_method,
                     "timestamp_ms": snap.timestamp_ms,
+                    "calendar_rev": vol_time.calendar_rev(vol_time.get_active_calendar()),
                     "fit": _fit_dict(fit) if fit else None,
                 }
                 await ws.send_text(json.dumps({

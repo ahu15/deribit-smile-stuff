@@ -290,10 +290,16 @@ function computeLegRow(
   // the fitted curve evaluated at this leg's strike. If the SABR feed isn't
   // ready, fall back to mark_iv so the row still prices.
   let liveVol: number | null = chainRow?.mark_iv ?? null;
-  if (mode === 'interpolated' && smileFit && parsed && fwd != null && t_years != null && t_years > 0) {
+  if (mode === 'interpolated' && smileFit && smileFit.kind === 'sabr'
+      && parsed && fwd != null && t_years != null && t_years > 0) {
+    // M3.7: fit params live in the tagged-union `params` bag. We narrow on
+    // `kind === 'sabr'` here; future SVI etc. legs would dispatch on a
+    // different branch (or the calibration evaluator table once M3.99
+    // wires the fair-curve readout).
+    const p = smileFit.params;
     const sabrVol = sabrLognormalVol(
       parsed.strike, fwd, t_years,
-      smileFit.alpha, smileFit.beta, smileFit.rho, smileFit.volvol,
+      p.alpha, p.beta, p.rho, p.volvol,
     );
     if (sabrVol != null && Number.isFinite(sabrVol) && sabrVol > 0) liveVol = sabrVol;
   }
@@ -431,7 +437,10 @@ function useSmileSnapshots(keys: ExpiryKey[]): Map<string, SmileSnapshot> {
       ctrls.push(ctrl);
       (async () => {
         try {
-          for await (const s of smileStream(k.currency, k.expiry)) {
+          // Canonical id (not the `sabr-naive` alias) so QuickPricer shares
+          // the oracle's WS conversation refcount with any open SmileChart
+          // on the same (currency, expiry) — both end up on one backend fit.
+          for await (const s of smileStream(k.currency, k.expiry, 'sabr_none_uniform_cal', null)) {
             if (ctrl.signal.aborted) break;
             setSnaps(prev => {
               const next = new Map(prev);

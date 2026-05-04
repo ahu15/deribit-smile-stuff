@@ -1,8 +1,11 @@
-"""Per-expiry SABR fit helpers.
+"""Per-expiry SABR fit math.
 
-Wraps `sabr_greeks.SABR.SABRfit` (Hagan 2002 lognormal expansion) with
-boundary handling and strike-grid sampling for the live smile chart. All
-inputs/outputs use decimal vols (e.g. 0.85 = 85%).
+Wraps `sabr_greeks.SABR.SABRfit` (Hagan 2002 lognormal expansion) and
+returns the raw parameter bag + sampled grid + market residual. The
+methodology-engine `FitResult` (tagged union with calendar_rev,
+t_years_cal/wkg, frozen params, weighted residuals etc.) lives in
+`backend.calibration.types` and is stamped by the calibrator on top of
+this raw result. All inputs/outputs use decimal vols (e.g. 0.85 = 85%).
 """
 
 from __future__ import annotations
@@ -34,17 +37,18 @@ def average_iv_by_strike(pairs: Iterable[tuple[float, float]]) -> tuple[list[flo
 
 
 @dataclass
-class FitResult:
+class SabrFit:
+    """Raw SABR fit (math layer) — calibrator wraps in a `FitResult`."""
     alpha: float
     rho: float
     volvol: float
     beta: float
     forward: float
     t_years: float
-    strikes: list[float]          # sampled strike grid for the fitted curve
-    fitted_iv: list[float]        # SABR vol at each grid strike
-    market_strikes: list[float]   # the strikes that actually fed the fit
-    market_iv: list[float]        # market mark_iv at those strikes
+    strikes: list[float]
+    fitted_iv: list[float]
+    market_strikes: list[float]
+    market_iv: list[float]
     residual_rms: float
 
 
@@ -55,12 +59,14 @@ def fit_smile(
     market_iv: list[float],
     beta: float = 1.0,
     grid_size: int = 81,
-) -> FitResult | None:
-    """Fit SABR to a single expiry.
+) -> SabrFit | None:
+    """Fit SABR to a single expiry. Returns the raw parameter bag + grid +
+    residual; the calibrator stamps M3.7 metadata (methodology, calendar_rev,
+    t_years_{cal,wkg}, weights, frozen) on top.
 
-    Returns None if there aren't enough usable points to fit (need ≥ 4 strikes
-    with positive vol). Filters out 0 / NaN IVs that Deribit sometimes emits
-    for far-OTM contracts.
+    Returns None if there aren't enough usable points (need ≥ 4 strikes with
+    positive vol). Filters out 0 / NaN IVs that Deribit sometimes emits for
+    far-OTM contracts.
     """
     if forward <= 0 or t_years <= 0 or len(strikes) != len(market_iv):
         return None
@@ -81,7 +87,6 @@ def fit_smile(
     except Exception:
         return None
 
-    # Sample a smooth curve across the observed strike range for plotting.
     k_min = float(k_arr.min())
     k_max = float(k_arr.max())
     grid = np.linspace(k_min, k_max, grid_size)
@@ -90,7 +95,6 @@ def fit_smile(
         alpha=alpha, beta=beta, rho=rho, volvol=volvol,
     )
 
-    # RMS residual of fit vs market on the actual quoted strikes.
     fitted_at_market = SABR.lognormal_vol(
         k=k_arr, f=forward, t=t_years,
         alpha=alpha, beta=beta, rho=rho, volvol=volvol,
@@ -98,7 +102,7 @@ def fit_smile(
     residual = np.asarray(fitted_at_market) - v_arr
     rms = float(np.sqrt(np.mean(residual * residual)))
 
-    return FitResult(
+    return SabrFit(
         alpha=float(alpha),
         rho=float(rho),
         volvol=float(volvol),

@@ -10,12 +10,15 @@ from backend.chain import (
     BookSummary, ChainRow, ChainSnapshot, OptionMark,
     expiry_ms, parse_expiry, parse_option_type, parse_strike,
 )
-from backend.fit import FitResult, average_iv_by_strike, fit_smile
+from backend.calibration import (
+    FitContext, FitResult, get_calibrator, resolve_alias,
+)
+from backend.fit import average_iv_by_strike
 from backend.history import HistoryStore, Sample
 from backend.iv import iv_from_price
 from backend.ratelimit import RateLimitStatus
 from backend.venues.base import VenueAdapter
-from backend.vol_time import get_active_calendar, vol_yte
+from backend.vol_time import cal_yte, calendar_rev, get_active_calendar, vol_yte
 from .auth import load_credentials
 from .rest_client import DeribitRestClient
 
@@ -53,6 +56,14 @@ class DeribitAdapter(VenueAdapter):
         self._tasks: list[asyncio.Task] = []
         self.history = HistoryStore()
         self.backfill = Backfill(self._rest, self.history, _SUPPORTED_CURRENCIES)
+        # Per-snapshot fit cache (M3.7): one fit per
+        # (currency, expiry, methodology, ts_method, snapshot_ts, calendar_rev)
+        # per chain poll. Pruned to the latest snapshot's ts on each insert
+        # so size stays bounded by `expiries × methodologies × subscribers`.
+        # ts_method is None today (M3.8 lands TS-dependent calibrators).
+        self._fit_cache: dict[
+            tuple[str, str, str, str | None, int, str], FitResult | None
+        ] = {}
 
     async def start(self) -> None:
         await self._rest.start()
@@ -237,40 +248,70 @@ class DeribitAdapter(VenueAdapter):
         rows.sort(key=lambda r: (expiry_ms(r.expiry) or 0, r.strike, r.option_type))
         return rows
 
-    def smile_fit(self, currency: str, expiry: str) -> FitResult | None:
-        """Fit SABR to the option-implied IVs for one expiry of the latest chain.
+    def smile_fit(
+        self,
+        currency: str,
+        expiry: str,
+        methodology: str = "sabr-naive",
+        ts_method: str | None = None,
+    ) -> FitResult | None:
+        """Fit one expiry of the latest chain under the given methodology.
 
-        Uses both calls and puts; Deribit's mark_iv agrees across the parity
-        pair, so combining gives a denser quote set without bias.
+        Dispatches through `backend.calibration.REGISTRY`; per-snapshot cache
+        ensures multiple subscribers at the same key hit one fit per chain
+        poll (HRT principle 1, backend half of the two-layer dedup).
         """
         snap = self._snapshots.get(currency)
         if not snap:
             return None
-        forward = 0.0
-        pairs: list[tuple[float, float]] = []
-        for name, mark in snap.marks.items():
-            if parse_expiry(name) != expiry:
-                continue
-            strike = parse_strike(name)
-            if strike is None:
-                continue
-            pairs.append((strike, mark.mark_iv))
-            if mark.underlying_price > 0:
-                forward = mark.underlying_price
-        strikes, ivs = average_iv_by_strike(pairs)
-        if forward <= 0 or not strikes:
-            return None
-
         ex_ms = expiry_ms(expiry)
         if ex_ms is None:
             return None
-        t_years = vol_yte(ex_ms, snap.timestamp_ms, get_active_calendar())
-        if t_years <= 0:
+        cal = get_active_calendar()
+        rev = calendar_rev(cal)
+
+        resolved = resolve_alias(methodology)
+        calibrator = get_calibrator(resolved)
+        if calibrator is None:
             return None
-        return fit_smile(forward, t_years, strikes, ivs, beta=1.0)
+
+        cache_key = (
+            currency, expiry, resolved, ts_method, snap.timestamp_ms, rev,
+        )
+        if cache_key in self._fit_cache:
+            return self._fit_cache[cache_key]
+
+        ctx = FitContext(
+            currency=currency,
+            expiry=expiry,
+            snapshot=snap,
+            t_years_cal=cal_yte(ex_ms, snap.timestamp_ms),
+            t_years_wkg=vol_yte(ex_ms, snap.timestamp_ms, cal),
+            calendar_rev=rev,
+            ts_snapshot=None,
+        )
+        result = calibrator.fit(ctx)
+        # Evict stale-snapshot entries on every insert — keeps the dict
+        # bounded by active subscribers × methodologies, not by uptime.
+        self._prune_fit_cache(currency, snap.timestamp_ms)
+        self._fit_cache[cache_key] = result
+        return result
+
+    def _prune_fit_cache(self, currency: str, latest_ts: int) -> None:
+        stale = [
+            k for k in self._fit_cache
+            if k[0] == currency and k[4] != latest_ts
+        ]
+        for k in stale:
+            del self._fit_cache[k]
 
     def historic_smile_fit(
-        self, currency: str, expiry: str, as_of_ms: int,
+        self,
+        currency: str,
+        expiry: str,
+        as_of_ms: int,
+        methodology: str = "sabr-naive",
+        ts_method: str | None = None,
     ) -> HistoricSmileFit:
         """One-shot SABR fit from each instrument's closest mark_iv sample to
         `as_of_ms`. Frozen reference curve for the smile chart's "compare-to"
@@ -330,11 +371,47 @@ class DeribitAdapter(VenueAdapter):
         ex_ms = expiry_ms(expiry)
         if ex_ms is None:
             return result
-        t_years = vol_yte(ex_ms, snapped_ms, get_active_calendar())
-        if t_years <= 0:
+        cal = get_active_calendar()
+        rev = calendar_rev(cal)
+        t_cal = cal_yte(ex_ms, snapped_ms)
+        t_wkg = vol_yte(ex_ms, snapped_ms, cal)
+        if t_cal <= 0 and t_wkg <= 0:
             return result
 
-        result.fit = fit_smile(forward, t_years, strikes, ivs, beta=1.0)
+        # Historic fits ride a synthetic ChainSnapshot whose marks are the
+        # snapped per-strike samples, so the calibrator's `fit(ctx)` walks
+        # the same code path as the live case. Snapshot-keyed caching does
+        # NOT apply here (M3.9 owns the bucketed historic cache).
+        synth_marks: dict[str, OptionMark] = {}
+        for k, v in zip(strikes, ivs):
+            # Synthetic instrument name only needs to round-trip through
+            # parse_expiry / parse_strike; option type is fixed since marks
+            # are already parity-collapsed in `pairs`.
+            synth_name = f"{currency}-{expiry}-{k:g}-C"
+            synth_marks[synth_name] = OptionMark(
+                instrument_name=synth_name,
+                mark_iv=float(v),
+                mark_price=0.0,
+                underlying_price=forward,
+                timestamp_ms=snapped_ms,
+            )
+        synth_snap = ChainSnapshot(
+            currency=currency, timestamp_ms=snapped_ms, marks=synth_marks,
+        )
+
+        calibrator = get_calibrator(methodology)
+        if calibrator is None:
+            return result
+        ctx = FitContext(
+            currency=currency,
+            expiry=expiry,
+            snapshot=synth_snap,
+            t_years_cal=t_cal,
+            t_years_wkg=t_wkg,
+            calendar_rev=rev,
+            ts_snapshot=None,
+        )
+        result.fit = calibrator.fit(ctx)
         result.market_points = list(zip(strikes, ivs))
         result.snapped_ms = snapped_ms
         result.forward = forward

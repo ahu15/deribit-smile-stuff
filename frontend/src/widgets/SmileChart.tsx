@@ -5,6 +5,7 @@ import {
   fetchHistoricSmile, smileStream,
   type HistoricSmile, type SmileSnapshot,
 } from '../worker/smileService';
+import { fetchMethodologies, type MethodologySpec } from '../worker/methodologyService';
 import { pickClosestExpiry } from '../shared/expiry';
 
 type Currency = 'BTC' | 'ETH';
@@ -16,6 +17,11 @@ interface SmileChartConfig {
   expiry: string | null;
   mode: Mode;
   intervalMin?: number;
+  // M3.7 — methodology engine plumbing. `methodology` is a registry id (or
+  // the legacy alias `sabr-naive`); `termStructure` is the curve method id
+  // for freeze-axis methodologies (M3.8). Default keeps M3.6 behavior.
+  methodology: string;
+  termStructure: string | null;
   // Display toggles. Curve = SABR fit line; mark/bid/ask = per-strike points.
   showCurve: boolean;
   showMark: boolean;
@@ -40,6 +46,11 @@ const DEFAULT_CONFIG: SmileChartConfig = {
   expiry: null,
   mode: 'live',
   intervalMin: 5,
+  // Canonical id, not the `sabr-naive` alias — the alias resolves to this
+  // anyway, but using the canonical form means the toolbar dropdown doesn't
+  // render two visible entries (alias + catalog) for the same fit.
+  methodology: 'sabr_none_uniform_cal',
+  termStructure: null,
   showCurve: true,
   showMark: true,
   showBid: false,
@@ -69,6 +80,15 @@ function SmileChart({ config, onConfigChange }: WidgetProps<SmileChartConfig>) {
   const [showSettings, setShowSettings] = useState(false);
   const [historic, setHistoric] = useState<HistoricSmile | null>(null);
   const [historicLoading, setHistoricLoading] = useState(false);
+  const [methodologies, setMethodologies] = useState<MethodologySpec[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchMethodologies().then(list => {
+      if (!cancelled) setMethodologies(list);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
 
   // The default as-of is "24h before this widget mounted" — captured once so
   // re-renders don't drift the default forward. The user can override via the
@@ -107,7 +127,10 @@ function SmileChart({ config, onConfigChange }: WidgetProps<SmileChartConfig>) {
     setError(null);
     (async () => {
       try {
-        for await (const s of smileStream(config.symbol, config.expiry!)) {
+        for await (const s of smileStream(
+          config.symbol, config.expiry!,
+          config.methodology, config.termStructure,
+        )) {
           if (ctrl.signal.aborted) break;
           setSnap(s);
         }
@@ -118,7 +141,7 @@ function SmileChart({ config, onConfigChange }: WidgetProps<SmileChartConfig>) {
       }
     })();
     return () => ctrl.abort();
-  }, [config.symbol, config.expiry, config.mode]);
+  }, [config.symbol, config.expiry, config.mode, config.methodology, config.termStructure]);
 
   // Chain subscription — only when we actually need bid/ask IV. The SABR fit
   // already carries the per-strike mark IV used to seed it, so we don't pay
@@ -154,12 +177,15 @@ function SmileChart({ config, onConfigChange }: WidgetProps<SmileChartConfig>) {
     }
     let cancelled = false;
     setHistoricLoading(true);
-    fetchHistoricSmile(config.symbol, config.expiry, effectiveAsOfMs)
+    fetchHistoricSmile(
+      config.symbol, config.expiry, effectiveAsOfMs,
+      config.methodology, config.termStructure,
+    )
       .then(j => { if (!cancelled) setHistoric(j); })
       .catch(() => { if (!cancelled) setHistoric(null); })
       .finally(() => { if (!cancelled) setHistoricLoading(false); });
     return () => { cancelled = true; };
-  }, [config.symbol, config.expiry, config.showHistoric, effectiveAsOfMs]);
+  }, [config.symbol, config.expiry, config.showHistoric, effectiveAsOfMs, config.methodology, config.termStructure]);
 
   const accent = ACCENT[config.symbol];
 
@@ -169,6 +195,7 @@ function SmileChart({ config, onConfigChange }: WidgetProps<SmileChartConfig>) {
         config={config}
         onConfigChange={onConfigChange}
         expiries={expiriesFromHttp}
+        methodologies={methodologies}
         snap={snap}
         historic={historic}
         historicLoading={historicLoading}
@@ -206,14 +233,19 @@ interface ToolbarProps {
   config: SmileChartConfig;
   onConfigChange: (c: SmileChartConfig) => void;
   expiries: string[];
+  methodologies: MethodologySpec[];
   snap: SmileSnapshot | null;
   historic: HistoricSmile | null;
   historicLoading: boolean;
   onToggleSettings: () => void;
 }
 
-function Toolbar({ config, onConfigChange, expiries, snap, historic, historicLoading, onToggleSettings }: ToolbarProps) {
+function Toolbar({ config, onConfigChange, expiries, methodologies, snap, historic, historicLoading, onToggleSettings }: ToolbarProps) {
   const fit = snap?.fit;
+  // M3.7: methodology dropdown ships two cells (cal vs wkg) of the
+  // sabr-none-uniform row. The TS dropdown is render-only — disabled until
+  // M3.8 lands the TermStructure curve builders.
+  const tsDropdownDisabled = true;
   return (
     <div style={{
       display: 'flex', alignItems: 'center', gap: 8,
@@ -236,6 +268,30 @@ function Toolbar({ config, onConfigChange, expiries, snap, historic, historicLoa
         {expiries.length === 0 && <option value="">(loading…)</option>}
         {expiries.map(e => <option key={e} value={e}>{e}</option>)}
       </select>
+      <select
+        value={config.methodology}
+        onChange={e => onConfigChange({ ...config, methodology: e.target.value })}
+        style={selectStyle}
+        title="calibration methodology"
+      >
+        {/* Always include the active value so an unresolved id still
+            renders rather than blanking the dropdown. */}
+        {!methodologies.some(m => m.id === config.methodology) && (
+          <option value={config.methodology}>{config.methodology}</option>
+        )}
+        {methodologies.map(m => (
+          <option key={m.id} value={m.id}>{m.label}</option>
+        ))}
+      </select>
+      <select
+        value={config.termStructure ?? ''}
+        onChange={e => onConfigChange({ ...config, termStructure: e.target.value || null })}
+        style={{ ...selectStyle, opacity: tsDropdownDisabled ? 0.5 : 1 }}
+        disabled={tsDropdownDisabled}
+        title="term-structure curve (M3.8)"
+      >
+        <option value="">— no TS —</option>
+      </select>
       <button onClick={onToggleSettings} style={btnStyle}>settings</button>
       <span style={{ color: 'var(--fg-mute)' }}>· live</span>
       {config.showHistoric && (
@@ -256,7 +312,7 @@ function Toolbar({ config, onConfigChange, expiries, snap, historic, historicLoa
       <div style={{ flex: 1 }} />
       {fit && (
         <span style={{ color: 'var(--fg-dim)', fontFamily: 'var(--font-data)' }}>
-          α={fit.alpha.toFixed(3)} ρ={fit.rho.toFixed(3)} ν={fit.volvol.toFixed(3)}
+          α={(fit.params.alpha ?? 0).toFixed(3)} ρ={(fit.params.rho ?? 0).toFixed(3)} ν={(fit.params.volvol ?? 0).toFixed(3)}
           {' · '}F={fit.forward.toFixed(2)}{' · '}T={fit.t_years.toFixed(3)}y
           {' · '}rms={(fit.residual_rms * 100).toFixed(2)}%
         </span>
@@ -748,22 +804,27 @@ registerWidget<SmileChartConfig>({
   title: 'Smile',
   component: SmileChart,
   defaultConfig: DEFAULT_CONFIG,
-  configVersion: 5,
+  configVersion: 6,
   // v1 → no display toggles. v2 → curve/mark/bid/ask toggles. v3 → adds
   // historic-fit toggles. v4 → adds xMin/xMax strike-axis zoom. v5 → drops
-  // historicAsOfMs from the saved config (it's now session-only state — a
-  // persisted absolute timestamp would be stale by next session anyway, since
-  // the backend's history buffer is only 24h deep). Old configs are accepted;
-  // the stale historicAsOfMs is silently discarded.
+  // historicAsOfMs from the saved config (session-only state). v6 → adds
+  // methodology + termStructure (M3.7); old configs default to the canonical
+  // sabr_none_uniform_cal id, which preserves the pre-M3.7 fit byte-for-byte.
   migrate: (_fromVersion, oldConfig) => {
     if (!oldConfig || typeof oldConfig !== 'object') return DEFAULT_CONFIG;
     const o = oldConfig as Partial<SmileChartConfig>;
+    // Normalize the legacy `sabr-naive` alias to its canonical id so the
+    // toolbar dropdown picks the catalog row rather than the fallback branch.
+    const m = o.methodology;
+    const methodology = !m || m === 'sabr-naive' ? DEFAULT_CONFIG.methodology : m;
     return {
       venue: 'deribit',
       symbol: (o.symbol as Currency) ?? DEFAULT_CONFIG.symbol,
       expiry: o.expiry ?? null,
       mode: o.mode ?? DEFAULT_CONFIG.mode,
       intervalMin: o.intervalMin ?? DEFAULT_CONFIG.intervalMin,
+      methodology,
+      termStructure: o.termStructure ?? DEFAULT_CONFIG.termStructure,
       showCurve: o.showCurve ?? true,
       showMark: o.showMark ?? true,
       showBid: o.showBid ?? false,
