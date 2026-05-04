@@ -15,6 +15,7 @@ from backend.history import HistoryStore, Sample
 from backend.iv import iv_from_price
 from backend.ratelimit import RateLimitStatus
 from backend.venues.base import VenueAdapter
+from backend.vol_time import get_active_calendar, vol_yte
 from .auth import load_credentials
 from .rest_client import DeribitRestClient
 
@@ -22,7 +23,6 @@ log = logging.getLogger(__name__)
 
 _SUPPORTED_CURRENCIES = ["BTC", "ETH"]
 _POLL_INTERVAL = 2.0  # seconds between book-summary polls
-_MS_PER_YEAR = 365.0 * 86400.0 * 1000.0
 _HOUR_MS = 60 * 60 * 1000
 _DAY_MS = 24 * _HOUR_MS
 
@@ -200,7 +200,7 @@ class DeribitAdapter(VenueAdapter):
             if (bid_iv is None or ask_iv is None) and mark.mark_iv > 0:
                 ex_ms = expiry_ms(inst_expiry)
                 if ex_ms is not None:
-                    t_years = (ex_ms - mark.timestamp_ms) / _MS_PER_YEAR
+                    t_years = vol_yte(ex_ms, mark.timestamp_ms, get_active_calendar())
                     is_call = (opt_type == "C")
                     if bid_iv is None and bid is not None and bid > 0:
                         bid_iv = iv_from_price(
@@ -264,7 +264,7 @@ class DeribitAdapter(VenueAdapter):
         ex_ms = expiry_ms(expiry)
         if ex_ms is None:
             return None
-        t_years = (ex_ms - snap.timestamp_ms) / _MS_PER_YEAR
+        t_years = vol_yte(ex_ms, snap.timestamp_ms, get_active_calendar())
         if t_years <= 0:
             return None
         return fit_smile(forward, t_years, strikes, ivs, beta=1.0)
@@ -330,7 +330,7 @@ class DeribitAdapter(VenueAdapter):
         ex_ms = expiry_ms(expiry)
         if ex_ms is None:
             return result
-        t_years = (ex_ms - snapped_ms) / _MS_PER_YEAR
+        t_years = vol_yte(ex_ms, snapped_ms, get_active_calendar())
         if t_years <= 0:
             return result
 

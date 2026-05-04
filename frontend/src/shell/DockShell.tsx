@@ -22,6 +22,7 @@ import '../widgets/Notes';
 import '../widgets/ChainTable';
 import '../widgets/SmileChart';
 import '../widgets/QuickPricer';
+import '../widgets/VolCalendar';
 
 // ---------- panel params ----------
 

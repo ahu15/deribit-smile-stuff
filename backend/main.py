@@ -19,6 +19,7 @@ from backend.fit import FitResult
 from backend.history import HistoryStore, Sample, TradePrint
 from backend.venues.deribit.adapter import DeribitAdapter
 from backend.venues import registry
+from backend import vol_time
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger(__name__)
@@ -50,6 +51,52 @@ app.add_middleware(
 async def rate_limit_status():
     adapter = registry.get("deribit")
     return dataclasses.asdict(adapter.rate_limit_status)
+
+
+# ---------- vol-time calendar (M3.6) ----------
+
+
+@app.get("/api/calendar")
+async def get_calendar():
+    """Return the active vol-time calendar plus its revision hash."""
+    cal = vol_time.get_active_calendar()
+    return {
+        **vol_time.calendar_to_dict(cal),
+        "rev": vol_time.calendar_rev(cal),
+    }
+
+
+@app.post("/api/calendar")
+async def put_calendar(payload: dict):
+    """Replace the active calendar. Does NOT trigger refits — that's
+    `recalibrate`'s job (separate button) so the user can stage edits
+    without burning compute on every keystroke.
+    """
+    try:
+        cal = vol_time.calendar_from_dict(payload)
+    except (ValueError, TypeError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=f"invalid calendar payload: {exc}")
+    vol_time.set_active_calendar(cal)
+    return {
+        **vol_time.calendar_to_dict(cal),
+        "rev": vol_time.calendar_rev(cal),
+    }
+
+
+@app.post("/api/calendar/recalibrate")
+async def recalibrate_calendar():
+    """Recompute every wkg-basis cached fit under the current calendar
+    revision. M3.6 ships the calendar plumbing; the bucketed fit cache that
+    actually has wkg-basis entries to recompute lands in M3.7/M3.9 — for now
+    this endpoint is a stub that reports a count of zero. The endpoint is
+    in place so the VolCalendar widget can wire the button without a
+    follow-up backend change later.
+    """
+    cal = vol_time.get_active_calendar()
+    return {
+        "rev": vol_time.calendar_rev(cal),
+        "recalibrated": 0,
+    }
 
 
 @app.get("/api/history/change")

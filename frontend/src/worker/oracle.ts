@@ -12,6 +12,7 @@ import './rateLimitService';
 import './historyService';
 import './smileService';
 import './busService';
+import './calendarService';
 
 const BACKEND_WS = 'ws://localhost:8000/ws/oracle';
 
