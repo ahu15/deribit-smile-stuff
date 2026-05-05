@@ -5,6 +5,12 @@ import {
   type CurveMethodSpec, type HistoricTermStructure, type TermStructureEnvelope,
   type TermStructureSnapshot,
 } from '../worker/termstructureService';
+import {
+  termStructureBucketsStream, type TsBucketEntry,
+} from '../worker/bucketsService';
+import {
+  COMPARE_PALETTE, COMPARE_CAP, CLAMP_WARN_MS, formatRelativeTime,
+} from '../shared/overlayUi';
 
 // M3.8 — live term-structure plot. Method dropdown comes from the curve
 // catalog; x-axis toggles cal/wkg time; y-axis toggles σ_atm | α | fwd-var.
@@ -24,6 +30,13 @@ interface TermStructureChartConfig {
   showCurve: boolean;
   showMarkers: boolean;
   showHistoric: boolean;
+  // M3.9 — overlay last N hourly-bucket TS curves behind live, color-faded
+  // by age. 0 = off; bounded at 24 (HistoryStore cap).
+  historyOverlayHours: number;
+  // M3.9 — list of TS curve methods to render as live overlays alongside
+  // the primary. Capped at 4. Cross-currency comparisons aren't supported
+  // here (the widget binds to a single currency).
+  compareMethods: string[];
   configVersion: number;
 }
 
@@ -36,7 +49,9 @@ const DEFAULT_CONFIG: TermStructureChartConfig = {
   showCurve: true,
   showMarkers: true,
   showHistoric: false,
-  configVersion: 1,
+  historyOverlayHours: 0,
+  compareMethods: [],
+  configVersion: 3,
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -102,6 +117,10 @@ function TermStructureChart({ config, onConfigChange }: WidgetProps<TermStructur
   const [showSettings, setShowSettings] = useState(false);
   const [historic, setHistoric] = useState<HistoricTermStructure | null>(null);
   const [historicLoading, setHistoricLoading] = useState(false);
+  // M3.9 hourly-bucket overlay state.
+  const [historyBuckets, setHistoryBuckets] = useState<TsBucketEntry[]>([]);
+  // M3.9 cross-method overlays — one TS envelope per active comparison.
+  const [compareEnvs, setCompareEnvs] = useState<Record<string, TermStructureEnvelope>>({});
 
   const mountTimeRef = useRef(Date.now());
   const defaultAsOfMs = mountTimeRef.current - DAY_MS;
@@ -143,6 +162,76 @@ function TermStructureChart({ config, onConfigChange }: WidgetProps<TermStructur
     return () => ctrl.abort();
   }, [config.symbol, config.method]);
 
+  // M3.9 hourly-bucket overlay subscription. Mirrors SmileChart's pattern:
+  // initial snapshot replaces, append replaces head if same bucket_ts else
+  // pushes a new entry. Skip the most recent on render — it's redundant
+  // with the live curve.
+  useEffect(() => {
+    if (!config.method || config.historyOverlayHours <= 0) {
+      setHistoryBuckets([]);
+      return;
+    }
+    // Clear stale buckets synchronously on every effect run so a method /
+    // currency switch doesn't leave the previous selection's curves in
+    // state until the first new snapshot arrives — old wkg-axis bucket
+    // data mixed with the new live curve was producing broken bounds.
+    setHistoryBuckets([]);
+    const ctrl = new AbortController();
+    const lookbackMs = config.historyOverlayHours * 60 * 60 * 1000;
+    (async () => {
+      try {
+        for await (const env of termStructureBucketsStream(
+          config.symbol, config.method, lookbackMs,
+        )) {
+          if (ctrl.signal.aborted) break;
+          if (env.kind === 'snapshot') {
+            setHistoryBuckets(env.buckets);
+          } else {
+            setHistoryBuckets(prev => {
+              const last = prev[prev.length - 1];
+              const next = { bucket_ts: env.bucket_ts, snapshot: env.snapshot };
+              if (last && last.bucket_ts === env.bucket_ts) {
+                return [...prev.slice(0, -1), next];
+              }
+              return [...prev, next];
+            });
+          }
+        }
+      } catch {
+        // Overlay is optional — failure shouldn't crash the chart.
+      }
+    })();
+    return () => ctrl.abort();
+  }, [config.symbol, config.method, config.historyOverlayHours]);
+
+  // M3.9 — cross-method comparison subscriptions. Open one
+  // termStructureStream per id; oracle dedup ensures other widgets on the
+  // same key share the upstream conversation (HRT principle 1).
+  useEffect(() => {
+    if (config.compareMethods.length === 0) {
+      setCompareEnvs({});
+      return;
+    }
+    const ids = config.compareMethods.slice(0, COMPARE_CAP);
+    const ctrls: AbortController[] = [];
+    setCompareEnvs({});
+    for (const id of ids) {
+      const ctrl = new AbortController();
+      ctrls.push(ctrl);
+      (async () => {
+        try {
+          for await (const e of termStructureStream(config.symbol, id)) {
+            if (ctrl.signal.aborted) break;
+            setCompareEnvs(prev => ({ ...prev, [id]: e }));
+          }
+        } catch {
+          // Comparison overlays are optional.
+        }
+      })();
+    }
+    return () => { for (const c of ctrls) c.abort(); };
+  }, [config.symbol, config.compareMethods]);
+
   useEffect(() => {
     if (!config.method || !config.showHistoric) {
       setHistoric(null);
@@ -173,12 +262,14 @@ function TermStructureChart({ config, onConfigChange }: WidgetProps<TermStructur
         env={env}
         historic={historic}
         historicLoading={historicLoading}
+        requestedAsOfMs={effectiveAsOfMs}
         onToggleSettings={() => setShowSettings(v => !v)}
       />
       {showSettings && (
         <SettingsPanel
           config={config}
           onConfigChange={onConfigChange}
+          methods={methods}
           historic={historic}
           asOfMs={effectiveAsOfMs}
           asOfOverridden={asOfOverride != null}
@@ -189,7 +280,15 @@ function TermStructureChart({ config, onConfigChange }: WidgetProps<TermStructur
       {error ? (
         <div style={{ padding: 12, color: 'var(--neg)' }}>error: {error}</div>
       ) : (
-        <Plot env={env} historic={historic} accent={accent} config={config} />
+        <Plot
+          env={env}
+          historic={historic}
+          historyBuckets={historyBuckets}
+          compareEnvs={compareEnvs}
+          methods={methods}
+          accent={accent}
+          config={config}
+        />
       )}
     </div>
   );
@@ -204,11 +303,13 @@ interface ToolbarProps {
   env: TermStructureEnvelope | null;
   historic: HistoricTermStructure | null;
   historicLoading: boolean;
+  requestedAsOfMs: number;
   onToggleSettings: () => void;
 }
 
 function Toolbar({
-  config, onConfigChange, methods, env, historic, historicLoading, onToggleSettings,
+  config, onConfigChange, methods, env, historic, historicLoading,
+  requestedAsOfMs, onToggleSettings,
 }: ToolbarProps) {
   const snap = env?.snapshot;
   return (
@@ -266,9 +367,23 @@ function Toolbar({
           <span style={{ color: 'var(--fg-dim)' }}>frozen</span>
           {historicLoading && ' …'}
           {historic?.snapped_ms != null && (
-            <span style={{ color: 'var(--fg-dim)', fontFamily: 'var(--font-data)' }}>
-              {' @ '}{new Date(historic.snapped_ms).toLocaleString()}
+            <span
+              style={{ color: 'var(--fg-dim)', fontFamily: 'var(--font-data)' }}
+              title={`snapped @ ${new Date(historic.snapped_ms).toLocaleString()}\n`
+                   + `requested @ ${new Date(requestedAsOfMs).toLocaleString()}`}
+            >
+              {' @ '}{formatRelativeTime(historic.snapped_ms, Date.now())}
             </span>
+          )}
+          {historic?.snapped_ms != null
+           && Math.abs(requestedAsOfMs - historic.snapped_ms) > CLAMP_WARN_MS && (
+            <span
+              style={{ color: 'var(--neg)', marginLeft: 4, fontFamily: 'var(--font-data)' }}
+              title={`Request was outside the data buffer — clamped.\n`
+                   + `Requested ${formatRelativeTime(requestedAsOfMs, Date.now())}, `
+                   + `actual ${formatRelativeTime(historic.snapped_ms, Date.now())}.\n`
+                   + `Buffer fills as the backend runs (24h cap).`}
+            >(clamped)</span>
           )}
           {historic && historic.snapped_ms == null && !historicLoading && (
             <span style={{ color: 'var(--bid)' }}>{' '}(no data)</span>
@@ -301,6 +416,7 @@ function Toolbar({
 interface SettingsPanelProps {
   config: TermStructureChartConfig;
   onConfigChange: (c: TermStructureChartConfig) => void;
+  methods: CurveMethodSpec[];
   historic: HistoricTermStructure | null;
   asOfMs: number;
   asOfOverridden: boolean;
@@ -322,8 +438,16 @@ function localInputValueToMs(v: string): number | null {
 }
 
 function SettingsPanel({
-  config, onConfigChange, historic, asOfMs, asOfOverridden, onAsOfChange, onClose,
+  config, onConfigChange, methods, historic, asOfMs, asOfOverridden, onAsOfChange, onClose,
 }: SettingsPanelProps) {
+  const compareIds = config.compareMethods;
+  const toggleCompare = (id: string) => {
+    if (id === config.method) return;
+    const has = compareIds.includes(id);
+    let next = has ? compareIds.filter(x => x !== id) : [...compareIds, id];
+    next = next.slice(-COMPARE_CAP);
+    onConfigChange({ ...config, compareMethods: next });
+  };
   const Toggle = (
     key: 'showCurve' | 'showMarkers' | 'showHistoric',
     label: string,
@@ -378,6 +502,79 @@ function SettingsPanel({
           {' – '}{new Date(historic.latest_ms).toLocaleTimeString()}
         </span>
       )}
+      <span style={{ width: 1, height: 14, background: 'var(--bg-2)', margin: '0 4px' }} />
+      <span
+        style={{ color: 'var(--fg-mute)', fontSize: 10, letterSpacing: '0.10em' }}
+        title="Show last N hourly-bucket TS curves behind the live one, faded by age"
+      >HISTORY</span>
+      <select
+        value={config.historyOverlayHours}
+        onChange={e => onConfigChange({
+          ...config,
+          historyOverlayHours: Number(e.target.value),
+        })}
+        style={selectStyle}
+      >
+        <option value={0}>off</option>
+        <option value={3}>last 3h</option>
+        <option value={6}>last 6h</option>
+        <option value={12}>last 12h</option>
+        <option value={24}>last 24h</option>
+      </select>
+      <span style={{ width: 1, height: 14, background: 'var(--bg-2)', margin: '0 4px' }} />
+      <span
+        style={{ color: 'var(--fg-mute)', fontSize: 10, letterSpacing: '0.10em' }}
+        title={`Cross-method overlays (max ${COMPARE_CAP}). Primary method always plots; toggle other methods to overlay them.`}
+      >COMPARE</span>
+      {methods.length === 0 ? (
+        <span style={{ color: 'var(--fg-mute)' }}>(loading…)</span>
+      ) : (
+        <details style={{ position: 'relative' }}>
+          <summary style={{ ...btnStyle, listStyle: 'none', cursor: 'pointer', display: 'inline-block' }}>
+            {compareIds.length === 0 ? 'pick…' : `${compareIds.length} selected`}
+          </summary>
+          <div style={{
+            position: 'absolute', top: '100%', left: 0,
+            background: 'var(--bg-1)', border: '1px solid var(--border)',
+            borderRadius: 3, padding: 6, zIndex: 10, minWidth: 220,
+            maxHeight: 220, overflowY: 'auto',
+          }}>
+            {methods.map(m => {
+              const checked = compareIds.includes(m.id);
+              const isPrimary = m.id === config.method;
+              const colorIdx = compareIds.indexOf(m.id);
+              const swatch = colorIdx >= 0 ? COMPARE_PALETTE[colorIdx % COMPARE_PALETTE.length] : null;
+              return (
+                <label
+                  key={m.id}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 6,
+                    padding: '2px 0', cursor: isPrimary ? 'default' : 'pointer',
+                    opacity: isPrimary ? 0.4 : 1,
+                  }}
+                  title={isPrimary ? 'this is the primary method' : m.id}
+                >
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    disabled={isPrimary || (!checked && compareIds.length >= COMPARE_CAP)}
+                    onChange={() => toggleCompare(m.id)}
+                  />
+                  {swatch && <span style={{ width: 10, height: 2, background: swatch, display: 'inline-block' }} />}
+                  <span style={{ color: 'var(--fg)', fontSize: 11 }}>{m.label}</span>
+                  {isPrimary && <span style={{ color: 'var(--fg-mute)', fontSize: 10 }}> (primary)</span>}
+                </label>
+              );
+            })}
+          </div>
+        </details>
+      )}
+      <button
+        onClick={() => onConfigChange({ ...config, compareMethods: [] })}
+        style={btnStyle}
+        disabled={compareIds.length === 0}
+        title="Clear comparison overlays"
+      >clear</button>
       <div style={{ flex: 1 }} />
       <button onClick={onClose} style={btnStyle}>done</button>
     </div>
@@ -389,13 +586,16 @@ function SettingsPanel({
 interface PlotProps {
   env: TermStructureEnvelope | null;
   historic: HistoricTermStructure | null;
+  historyBuckets: TsBucketEntry[];
+  compareEnvs: Record<string, TermStructureEnvelope>;
+  methods: CurveMethodSpec[];
   accent: string;
   config: TermStructureChartConfig;
 }
 
 const PAD = { top: 12, right: 16, bottom: 28, left: 56 };
 
-function Plot({ env, historic, accent, config }: PlotProps) {
+function Plot({ env, historic, historyBuckets, compareEnvs, methods, accent, config }: PlotProps) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const [size, setSize] = useState({ w: 0, h: 0 });
@@ -435,6 +635,21 @@ function Plot({ env, historic, accent, config }: PlotProps) {
       xs.push(...pickGrid(histSnap, config.xAxis));
       ys.push(...pickYGrid(histSnap, config.yAxis));
     }
+    if (config.historyOverlayHours > 0) {
+      // Skip head — already covered by the live curve.
+      for (let h = 0; h < historyBuckets.length - 1; h++) {
+        const s = historyBuckets[h].snapshot;
+        if (!s) continue;
+        xs.push(...pickGrid(s, config.xAxis));
+        ys.push(...pickYGrid(s, config.yAxis));
+      }
+    }
+    for (const id of config.compareMethods) {
+      const ce = compareEnvs[id];
+      if (!ce?.snapshot) continue;
+      xs.push(...pickGrid(ce.snapshot, config.xAxis));
+      ys.push(...pickYGrid(ce.snapshot, config.yAxis));
+    }
     if (xs.length === 0 || ys.length === 0) return null;
     const xmin = Math.min(...xs);
     const xmax = Math.max(...xs);
@@ -443,7 +658,7 @@ function Plot({ env, historic, accent, config }: PlotProps) {
     if (!Number.isFinite(xmin) || !Number.isFinite(xmax) || xmin >= xmax) return null;
     const yPad = (ymax - ymin) * 0.1 || 0.01;
     return { xmin, xmax, ymin: Math.max(0, ymin - yPad), ymax: ymax + yPad };
-  }, [snap, histSnap, market, config.xAxis, config.yAxis, config.showMarkers]);
+  }, [snap, histSnap, historyBuckets, compareEnvs, market, config.xAxis, config.yAxis, config.showMarkers, config.historyOverlayHours, config.compareMethods]);
 
   const sx = (x: number) => bounds == null
     ? 0
@@ -473,6 +688,50 @@ function Plot({ env, historic, accent, config }: PlotProps) {
     }
     return d;
   }, [histSnap, bounds, config.xAxis, config.yAxis]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Hourly-bucket overlay paths — drop the head (visually identical to the
+  // live curve) and any null-snapshot entries (cold history at session
+  // start). Age-based alpha so the most recent overlay reads strongest.
+  const overlayCurves = useMemo(() => {
+    if (!bounds || config.historyOverlayHours <= 0) return [];
+    const trimmed = historyBuckets.slice(0, -1).filter(b => b.snapshot != null);
+    if (trimmed.length === 0) return [];
+    return trimmed.map((b, i, arr) => {
+      const s = b.snapshot as TermStructureSnapshot;
+      const xs = pickGrid(s, config.xAxis);
+      const ys = pickYGrid(s, config.yAxis);
+      let d = '';
+      for (let j = 0; j < xs.length; j++) {
+        d += `${j === 0 ? 'M' : 'L'}${sx(xs[j]).toFixed(2)},${sy(ys[j]).toFixed(2)} `;
+      }
+      const t = arr.length === 1 ? 0.5 : i / (arr.length - 1);
+      const opacity = 0.15 + 0.50 * t;
+      return { d, opacity, bucket_ts: b.bucket_ts };
+    });
+  }, [historyBuckets, bounds, config.xAxis, config.yAxis, config.historyOverlayHours]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Cross-method comparison curves — solid 1px lines in palette colors.
+  // Filter out the primary so a stale saved profile that listed it
+  // doesn't render the same curve twice.
+  const compareCurves = useMemo(() => {
+    if (!bounds || config.compareMethods.length === 0) return [];
+    const ids = config.compareMethods
+      .filter(id => id !== config.method)
+      .slice(0, COMPARE_CAP);
+    return ids.map((id, i) => {
+      const ce = compareEnvs[id];
+      const s = ce?.snapshot;
+      if (!s) return null;
+      const xs = pickGrid(s, config.xAxis);
+      const ys = pickYGrid(s, config.yAxis);
+      let d = '';
+      for (let j = 0; j < xs.length; j++) {
+        d += `${j === 0 ? 'M' : 'L'}${sx(xs[j]).toFixed(2)},${sy(ys[j]).toFixed(2)} `;
+      }
+      const label = methods.find(m => m.id === id)?.label ?? id;
+      return { id, d, color: COMPARE_PALETTE[i % COMPARE_PALETTE.length], label };
+    }).filter((x): x is { id: string; d: string; color: string; label: string } => x !== null);
+  }, [compareEnvs, methods, bounds, config.method, config.compareMethods, config.xAxis, config.yAxis]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const xTicks = useMemo(() => makeTicks(bounds?.xmin, bounds?.xmax, 6), [bounds]);
   const yTicks = useMemo(() => makeTicks(bounds?.ymin, bounds?.ymax, 5), [bounds]);
@@ -528,8 +787,47 @@ function Plot({ env, historic, accent, config }: PlotProps) {
               strokeDasharray="4 3"
             />
           )}
+          {/* Hourly-bucket overlays — theme-adaptive `--fg` (black on
+              light, white on dark) drawn dotted so they read as
+              "historic reference" against the colored live curve. */}
+          {overlayCurves.map(c => (
+            <path
+              key={`b-${c.bucket_ts}`}
+              d={c.d} fill="none"
+              stroke="var(--fg)" strokeOpacity={c.opacity}
+              strokeWidth={1} strokeDasharray="1 3"
+            />
+          ))}
+          {/* Cross-method comparison curves — palette-colored solid lines. */}
+          {compareCurves.map(c => (
+            <path
+              key={`c-${c.id}`}
+              d={c.d} fill="none"
+              stroke={c.color} strokeWidth={1}
+              strokeOpacity={0.85}
+            />
+          ))}
           {config.showCurve && (
             <path d={path} fill="none" stroke={accent} strokeWidth={1.5} />
+          )}
+          {compareCurves.length > 0 && (
+            <g pointerEvents="none">
+              {[
+                {
+                  color: accent,
+                  label: methods.find(m => m.id === config.method)?.label ?? config.method,
+                },
+                ...compareCurves.map(c => ({ color: c.color, label: c.label })),
+              ].map((row, idx) => (
+                <g
+                  key={`leg-${idx}`}
+                  transform={`translate(${size.w - PAD.right - 200}, ${PAD.top + 4 + idx * 12})`}
+                >
+                  <line x1={0} y1={5} x2={14} y2={5} stroke={row.color} strokeWidth={2} />
+                  <text x={18} y={8} fontSize={10} fill="var(--fg-dim)">{row.label}</text>
+                </g>
+              ))}
+            </g>
           )}
           {config.showMarkers && market && market.xs.map((x, i) => {
             const expiryMs = snapTsMs != null
@@ -663,7 +961,9 @@ const btnStyle: React.CSSProperties = {
 };
 
 // v1 → original. v2 → curve method renames (ts_alpha_dmr_*/ts_atm_linear_dmr_*
-// → ts_atm_dmr_*) and drop volvol_grid/atm-curve picker noise.
+// → ts_atm_dmr_*) and drop volvol_grid/atm-curve picker noise; also adds
+// `historyOverlayHours` (M3.9, default off — backwards compatible).
+// v3 → adds `compareMethods` (M3.9, default empty).
 const CURVE_METHOD_RENAMES: Record<string, string> = {
   'ts_alpha_dmr_cal': 'ts_atm_dmr_cal',
   'ts_alpha_dmr_wkg': 'ts_atm_dmr_wkg',
@@ -676,7 +976,7 @@ registerWidget<TermStructureChartConfig>({
   title: 'Term Structure',
   component: TermStructureChart,
   defaultConfig: DEFAULT_CONFIG,
-  configVersion: 2,
+  configVersion: 3,
   migrate: (_fromVersion, oldConfig) => {
     if (!oldConfig || typeof oldConfig !== 'object') return DEFAULT_CONFIG;
     const o = oldConfig as Partial<TermStructureChartConfig>;
@@ -684,7 +984,10 @@ registerWidget<TermStructureChartConfig>({
     const method = m && CURVE_METHOD_RENAMES[m]
       ? CURVE_METHOD_RENAMES[m]
       : m ?? DEFAULT_CONFIG.method;
-    return { ...DEFAULT_CONFIG, ...o, method };
+    const compareMethods = Array.isArray(o.compareMethods)
+      ? o.compareMethods.filter(x => typeof x === 'string').slice(0, COMPARE_CAP)
+      : [];
+    return { ...DEFAULT_CONFIG, ...o, method, compareMethods };
   },
   accentColor: ACCENT.BTC,
 });

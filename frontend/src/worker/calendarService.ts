@@ -42,8 +42,10 @@ export interface CalendarPayload {
 
 export interface RecalibrateResult {
   rev: string;
-  /** Number of cached fits recomputed. Stub = 0 in M3.6 — the bucketed
-   *  fit cache that has wkg-basis entries to refit lands in M3.7/M3.9. */
+  /** Number of stale-rev wkg-basis cache entries dropped. Cal-basis entries
+   *  don't depend on rev, so they're skipped. Live bucket pumps notice the
+   *  rev change on their next chain poll and re-emit a fresh
+   *  `*_buckets_snapshot` so subscribers redraw without remount. */
   recalibrated: number;
 }
 
@@ -172,9 +174,11 @@ export function putCalendar(calendar: Omit<CalendarPayload, 'rev'>): Promise<Cal
   return oneShot<CalendarPayload>(subscribeRemote('calendarPut', { calendar, _tag }));
 }
 
-/** Trigger backend recalibrate. M3.6 stub returns `{recalibrated: 0}`;
- *  the count becomes meaningful once M3.7/M3.9 ship the wkg-basis fit
- *  cache. Carries a unique tag for the same reason as `putCalendar`. */
+/** Trigger backend recalibrate. Drops every stale-rev wkg-basis entry
+ *  from the per-snapshot fit/TS caches and the M3.9 bucketed caches; the
+ *  next chain poll lazily recomputes them under the new rev. Carries a
+ *  unique tag so the oracle's refcount-based dedup can't collapse rapid
+ *  successive calls. */
 export function recalibrate(): Promise<RecalibrateResult> {
   const _tag = `${++_recalCounter}-${Date.now()}`;
   return oneShot<RecalibrateResult>(subscribeRemote('calendarRecalibrate', { _tag }));

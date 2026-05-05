@@ -125,19 +125,24 @@ class DeribitRestClient:
     ) -> list[dict]:
         """One call returns trades across every instrument of `kind` for `currency`.
 
-        We page by walking `start_seq` backwards until we either pass
-        `start_timestamp` or run out — Deribit returns trades newest-first.
+        Deribit returns trades **oldest-first** for a `[start, end]` window
+        with `include_old=true`, so we page forward by advancing
+        `start_timestamp` past the latest trade in the previous page until
+        `has_more` is false. (The original implementation walked the cursor
+        backwards from `end`, which made the first page chase its own tail
+        and silently capped the backfill at ~1000 trades — the oldest
+        sliver of the window only.)
         """
         all_trades: list[dict] = []
-        cursor_end = end_timestamp
+        cursor_start = start_timestamp
         for _ in range(20):  # hard ceiling — 20 * 1000 = 20k trades / ccy / 24h is plenty
             result = await self._get(
                 "public/get_last_trades_by_currency_and_time",
                 {
                     "currency": currency,
                     "kind": kind,
-                    "start_timestamp": start_timestamp,
-                    "end_timestamp": cursor_end,
+                    "start_timestamp": cursor_start,
+                    "end_timestamp": end_timestamp,
                     "count": count,
                     "include_old": True,
                 },
@@ -149,11 +154,12 @@ class DeribitRestClient:
             all_trades.extend(page)
             if not (result or {}).get("has_more"):
                 break
-            # Continue from just before the oldest trade in this page.
-            oldest_ts = min(t.get("timestamp", cursor_end) for t in page)
-            if oldest_ts <= start_timestamp:
+            # Advance past the most-recent trade in this page so the next
+            # call returns the next batch forward in time.
+            latest_ts = max(t.get("timestamp", cursor_start) for t in page)
+            if latest_ts >= end_timestamp:
                 break
-            cursor_end = oldest_ts - 1
+            cursor_start = latest_ts + 1
         return all_trades
 
     async def get_tradingview_chart_data(

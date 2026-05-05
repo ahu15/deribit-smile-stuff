@@ -11,7 +11,9 @@ from backend.chain import (
     expiry_ms, parse_expiry, parse_option_type, parse_strike,
 )
 from backend.calibration import (
-    FitContext, FitResult, get_calibrator, resolve_alias,
+    FitContext, FitResult, SmileBucketKey, TsBucketKey,
+    bucket_boundaries, bucket_floor, evict_old_smile_buckets,
+    evict_old_ts_buckets, get_calibrator, resolve_alias,
 )
 from backend.curves import (
     BuildContext, TermStructureSnapshot, get_curve_builder,
@@ -73,14 +75,36 @@ class DeribitAdapter(VenueAdapter):
         self._ts_cache: dict[
             tuple[str, str, int, str], TermStructureSnapshot | None
         ] = {}
+        # Bucketed historic-fit cache (M3.9): hourly-boundary fits across
+        # the trailing 24h, seeded on first subscription per `(currency,
+        # expiry, methodology, ts_method)` from `HistoryStore` chain
+        # replay. Powers the history-overlay UI in SmileChart /
+        # TermStructureChart and (later) M4.5's `AnalysisService.fitHistory`.
+        self._smile_bucket_cache: dict[SmileBucketKey, FitResult | None] = {}
+        self._ts_bucket_cache: dict[TsBucketKey, TermStructureSnapshot | None] = {}
 
     async def start(self) -> None:
         await self._rest.start()
+        # Run backfill first, THEN spawn the live poll loops. The HistoryStore
+        # rejects out-of-order writes (a stale poll mid-backfill mustn't
+        # overwrite freshly-seeded data) — but if live polls run first, every
+        # 24h-old backfill sample lands "in the past" relative to the live
+        # samples already in the buffer and gets silently dropped. Running
+        # backfill first costs ~5s of empty chain at startup (the StatusPill
+        # already shows `history NN%` during this window), but means the
+        # frozen-overlay actually has historic data to snap to.
+        self._tasks.append(asyncio.create_task(self._startup_seed_then_live()))
+        log.info("DeribitAdapter started — backfill first, then REST polling @ %.0fs", _POLL_INTERVAL)
+
+    async def _startup_seed_then_live(self) -> None:
+        try:
+            await self.backfill.run()
+        except Exception as exc:
+            # Even if backfill fails partway, start live polling so the UI
+            # isn't permanently empty. Trade-seed coverage will be partial.
+            log.warning("backfill failed: %s — starting live polling anyway", exc)
         for ccy in _SUPPORTED_CURRENCIES:
             self._tasks.append(asyncio.create_task(self._poll_loop(ccy)))
-        # Backfill runs at PRIORITY_BACKFILL — live polling preempts via the queue.
-        self._tasks.append(asyncio.create_task(self.backfill.run()))
-        log.info("DeribitAdapter started — REST polling @ %.0fs + backfill", _POLL_INTERVAL)
 
     async def stop(self) -> None:
         for t in self._tasks:
@@ -475,12 +499,20 @@ class DeribitAdapter(VenueAdapter):
         calibrator = get_calibrator(methodology)
         if calibrator is None:
             return result
-        # Historic fits run on the synthetic snapshot only — TS dependencies
-        # are not replayed (would require historic naive-SABR fits across all
-        # expiries, which the M3.9 bucketed cache will own). For now,
-        # requires_ts methodologies fall through and return result.fit=None.
+        # `requires_ts` methodologies need a TS curve at the same snapped
+        # timestamp as the smile. `term_structure_bucket_fit` already
+        # replays the chain at any ts (cached by `(currency, method, ts,
+        # rev)`) — reuse it so the historic α prior comes from the same
+        # moment in time as the historic smile data, not the live chain.
+        ts_snapshot: TermStructureSnapshot | None = None
         if calibrator.requires_ts:
-            return result
+            if not ts_method:
+                return result
+            ts_snapshot = self.term_structure_bucket_fit(
+                currency, ts_method, snapped_ms,
+            )
+            if ts_snapshot is None:
+                return result
         ctx = FitContext(
             currency=currency,
             expiry=expiry,
@@ -488,7 +520,7 @@ class DeribitAdapter(VenueAdapter):
             t_years_cal=t_cal,
             t_years_wkg=t_wkg,
             calendar_rev=rev,
-            ts_snapshot=None,
+            ts_snapshot=ts_snapshot,
             history_store=self.history,
         )
         result.fit = calibrator.fit(ctx)
@@ -594,6 +626,277 @@ class DeribitAdapter(VenueAdapter):
                 if parse_expiry(mark.instrument_name) == expiry and mark.underlying_price > 0:
                     return mark.underlying_price
         return None
+
+    # ---------- M3.9 bucketed historic fits ----------
+
+    def _replay_chain_at(
+        self,
+        currency: str,
+        as_of_ms: int,
+        expiry_filter: str | None = None,
+    ) -> ChainSnapshot | None:
+        """Replay `HistoryStore` at `as_of_ms`: snap each option's mark_iv
+        and underlying_price to its closest sample, return a synthetic
+        `ChainSnapshot` whose marks reflect the chain at that moment.
+
+        Used by the bucket fit machinery; does not touch the legacy
+        `historic_smile_fit` / `historic_term_structure_fit` paths so
+        their byte-identical behavior is preserved (the M3.9d invalidation
+        story leans on this — old historic envelopes shouldn't change
+        shape just because buckets started using a shared helper).
+
+        Returns None if there are no samples to snap to (cold cache, or
+        the as_of is outside the 24h window for every instrument).
+        """
+        snap = self._snapshots.get(currency)
+        if not snap:
+            return None
+        synth_marks: dict[str, OptionMark] = {}
+        for name in snap.marks:
+            inst_expiry = parse_expiry(name)
+            if expiry_filter and inst_expiry != expiry_filter:
+                continue
+            if inst_expiry is None:
+                continue
+            samples = self.history.series(name, "mark_iv")
+            if not samples:
+                continue
+            best = min(samples, key=lambda s: abs(s.ts_ms - as_of_ms))
+            fwd = self._forward_at(currency, inst_expiry, best.ts_ms)
+            if fwd is None or fwd <= 0:
+                continue
+            synth_marks[name] = OptionMark(
+                instrument_name=name,
+                mark_iv=float(best.value),
+                mark_price=0.0,
+                underlying_price=float(fwd),
+                timestamp_ms=best.ts_ms,
+            )
+        if not synth_marks:
+            return None
+        return ChainSnapshot(
+            currency=currency,
+            timestamp_ms=as_of_ms,
+            marks=synth_marks,
+        )
+
+    def smile_bucket_fit(
+        self,
+        currency: str,
+        expiry: str,
+        methodology: str,
+        ts_method: str | None,
+        bucket_ts: int,
+    ) -> FitResult | None:
+        """Cached historic SABR fit at bucket boundary `bucket_ts`.
+
+        Cache key includes `calendar_rev` so a recalibrate naturally drops
+        wkg-basis entries on next access; cal-basis entries don't depend on
+        rev but the field rides on the key uniformly (no false collisions
+        possible since the rev string is identical for all cal entries
+        computed under the same calendar).
+
+        For `requires_ts` calibrators, recursively asks `term_structure_bucket_fit`
+        for the curve at the same bucket boundary — so the historic fit and
+        its TS prior land in the same point in time.
+        """
+        ex_ms = expiry_ms(expiry)
+        if ex_ms is None:
+            return None
+        cal = get_active_calendar()
+        rev = calendar_rev(cal)
+        resolved = resolve_alias(methodology)
+        calibrator = get_calibrator(resolved)
+        if calibrator is None:
+            return None
+        if calibrator.requires_ts and not ts_method:
+            return None
+
+        key: SmileBucketKey = (currency, expiry, resolved, ts_method, bucket_ts, rev)
+        if key in self._smile_bucket_cache:
+            return self._smile_bucket_cache[key]
+
+        synth = self._replay_chain_at(currency, bucket_ts, expiry_filter=expiry)
+        if synth is None:
+            self._smile_bucket_cache[key] = None
+            return None
+
+        # t_years anchored at the bucket boundary, not `now`, so historic
+        # buckets see the same time-to-expiry the calibrator would have
+        # consumed at that moment.
+        t_cal = cal_yte(ex_ms, bucket_ts)
+        t_wkg = vol_yte(ex_ms, bucket_ts, cal)
+        if t_cal <= 0 and t_wkg <= 0:
+            self._smile_bucket_cache[key] = None
+            return None
+
+        ts_snapshot: TermStructureSnapshot | None = None
+        if calibrator.requires_ts and ts_method:
+            ts_snapshot = self.term_structure_bucket_fit(currency, ts_method, bucket_ts)
+
+        ctx = FitContext(
+            currency=currency,
+            expiry=expiry,
+            snapshot=synth,
+            t_years_cal=t_cal,
+            t_years_wkg=t_wkg,
+            calendar_rev=rev,
+            ts_snapshot=ts_snapshot,
+            history_store=self.history,
+        )
+        result = calibrator.fit(ctx)
+        evict_old_smile_buckets(self._smile_bucket_cache, _now_ms())
+        self._smile_bucket_cache[key] = result
+        return result
+
+    def term_structure_bucket_fit(
+        self,
+        currency: str,
+        method: str,
+        bucket_ts: int,
+    ) -> TermStructureSnapshot | None:
+        """Cached historic curve build at bucket boundary `bucket_ts`."""
+        builder = get_curve_builder(method)
+        if builder is None:
+            return None
+        cal = get_active_calendar()
+        rev = calendar_rev(cal)
+        key: TsBucketKey = (currency, method, bucket_ts, rev)
+        if key in self._ts_bucket_cache:
+            return self._ts_bucket_cache[key]
+
+        synth = self._replay_chain_at(currency, bucket_ts)
+        if synth is None:
+            self._ts_bucket_cache[key] = None
+            return None
+
+        t_cal_by_expiry: dict[str, float] = {}
+        t_wkg_by_expiry: dict[str, float] = {}
+        for ex in synth.expiries():
+            ex_ms = expiry_ms(ex)
+            if ex_ms is None:
+                continue
+            t_cal = cal_yte(ex_ms, bucket_ts)
+            t_wkg = vol_yte(ex_ms, bucket_ts, cal)
+            if t_cal <= 0 or t_wkg <= 0:
+                continue
+            t_cal_by_expiry[ex] = t_cal
+            t_wkg_by_expiry[ex] = t_wkg
+
+        ctx = BuildContext(
+            currency=currency,
+            snapshot=synth,
+            t_years_cal_by_expiry=t_cal_by_expiry,
+            t_years_wkg_by_expiry=t_wkg_by_expiry,
+            calendar_rev=rev,
+        )
+        result = builder.build(ctx)
+        evict_old_ts_buckets(self._ts_bucket_cache, _now_ms())
+        self._ts_bucket_cache[key] = result
+        return result
+
+    def smile_buckets(
+        self,
+        currency: str,
+        expiry: str,
+        methodology: str,
+        ts_method: str | None,
+        lookback_ms: int,
+        now_ms: int | None = None,
+    ) -> list[tuple[int, FitResult | None]]:
+        """Hourly-bucket smile fits across the trailing `lookback_ms`.
+
+        Returns ascending-by-time list of (bucket_ts, fit) tuples. Misses
+        hit `smile_bucket_fit` (caches first-touch, evicts >24h). The
+        most-recent entry is the in-progress current hour and updates on
+        subsequent chain polls within that hour.
+        """
+        if now_ms is None:
+            now_ms = _now_ms()
+        out: list[tuple[int, FitResult | None]] = []
+        for bucket_ts in bucket_boundaries(now_ms, lookback_ms):
+            fit = self.smile_bucket_fit(
+                currency, expiry, methodology, ts_method, bucket_ts,
+            )
+            out.append((bucket_ts, fit))
+        return out
+
+    def term_structure_buckets(
+        self,
+        currency: str,
+        method: str,
+        lookback_ms: int,
+        now_ms: int | None = None,
+    ) -> list[tuple[int, TermStructureSnapshot | None]]:
+        """Hourly-bucket TS snapshots across the trailing `lookback_ms`."""
+        if now_ms is None:
+            now_ms = _now_ms()
+        out: list[tuple[int, TermStructureSnapshot | None]] = []
+        for bucket_ts in bucket_boundaries(now_ms, lookback_ms):
+            ts = self.term_structure_bucket_fit(currency, method, bucket_ts)
+            out.append((bucket_ts, ts))
+        return out
+
+    def latest_bucket_floor(self) -> int:
+        """Wall-clock-floor of `now` in ms — used by the WS pump to detect
+        when a new hour boundary has crossed since the last chain poll."""
+        return bucket_floor(_now_ms())
+
+    def recalibrate_wkg_caches(self, current_rev: str) -> int:
+        """Drop every wkg-basis cache entry whose `calendar_rev` is stale.
+
+        Cal-basis entries don't depend on `calendar_rev` so they're skipped.
+        Returns the count of entries dropped — they'll be lazily recomputed
+        on next access (live pumps detect the rev change on their next chain
+        poll and re-emit a fresh snapshot, so subscribers don't lose state).
+        """
+        n = 0
+
+        def _wkg_calibrator(methodology: str) -> bool:
+            cal = get_calibrator(methodology)
+            return cal is not None and cal.time_basis == "wkg"
+
+        def _wkg_builder(method: str) -> bool:
+            b = get_curve_builder(method)
+            return b is not None and b.time_basis == "wkg"
+
+        # _fit_cache: (currency, expiry, methodology, ts_method, snapshot_ts, rev)
+        stale_fits = [
+            k for k in self._fit_cache
+            if _wkg_calibrator(k[2]) and k[5] != current_rev
+        ]
+        for k in stale_fits:
+            del self._fit_cache[k]
+            n += 1
+
+        # _ts_cache: (currency, ts_method, snapshot_ts, rev)
+        stale_ts = [
+            k for k in self._ts_cache
+            if _wkg_builder(k[1]) and k[3] != current_rev
+        ]
+        for k in stale_ts:
+            del self._ts_cache[k]
+            n += 1
+
+        # _smile_bucket_cache: (currency, expiry, methodology, ts_method, bucket_ts, rev)
+        stale_smile_buckets = [
+            k for k in self._smile_bucket_cache
+            if _wkg_calibrator(k[2]) and k[5] != current_rev
+        ]
+        for k in stale_smile_buckets:
+            del self._smile_bucket_cache[k]
+            n += 1
+
+        # _ts_bucket_cache: (currency, ts_method, bucket_ts, rev)
+        stale_ts_buckets = [
+            k for k in self._ts_bucket_cache
+            if _wkg_builder(k[1]) and k[3] != current_rev
+        ]
+        for k in stale_ts_buckets:
+            del self._ts_bucket_cache[k]
+            n += 1
+
+        return n
 
     async def ping_deribit(self) -> dict:
         """Round-trip ping that hits Deribit — for end-to-end pingService test."""

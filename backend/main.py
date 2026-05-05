@@ -128,18 +128,19 @@ async def term_structure_historic(currency: str, method: str, as_of_ms: int):
 
 @app.post("/api/calendar/recalibrate")
 async def recalibrate_calendar():
-    """Recompute every wkg-basis cached fit under the current calendar
-    revision. The per-snapshot cache (M3.7) self-invalidates via its
-    `calendar_rev` cache key on the next chain poll, so live subscribers
-    pick up new fits within ~2 s without this endpoint doing anything.
-    The bucketed historic-fit cache that this endpoint will actually walk
-    lands in M3.9; until then the response reports a count of zero.
+    """Drop every wkg-basis cached entry whose `calendar_rev` is stale.
+
+    Walks the per-snapshot fit/TS caches AND the M3.9 bucketed caches.
+    Cal-basis entries are skipped (their key doesn't depend on rev).
+    Dropped entries are recomputed lazily on next access — live bucket
+    pumps detect the rev change on their next chain poll and re-emit a
+    fresh `*_buckets_snapshot` so subscribers redraw without remount.
     """
+    adapter: DeribitAdapter = registry.get("deribit")
     cal = vol_time.get_active_calendar()
-    return {
-        "rev": vol_time.calendar_rev(cal),
-        "recalibrated": 0,
-    }
+    rev = vol_time.calendar_rev(cal)
+    n = adapter.recalibrate_wkg_caches(rev)
+    return {"rev": rev, "recalibrated": n}
 
 
 @app.get("/api/history/change")
@@ -279,6 +280,16 @@ async def oracle_ws(websocket: WebSocket):
                 conv = str(msg.get("conversationId") or "")
                 if conv:
                     subs[conv] = await _subscribe_termstructure(websocket, adapter, msg, conv)
+
+            elif mtype == "subscribe_smile_buckets":
+                conv = str(msg.get("conversationId") or "")
+                if conv:
+                    subs[conv] = await _subscribe_smile_buckets(websocket, adapter, msg, conv)
+
+            elif mtype == "subscribe_termstructure_buckets":
+                conv = str(msg.get("conversationId") or "")
+                if conv:
+                    subs[conv] = await _subscribe_termstructure_buckets(websocket, adapter, msg, conv)
 
             elif mtype == "unsubscribe":
                 conv = str(msg.get("conversationId") or "")
@@ -688,6 +699,246 @@ async def _subscribe_termstructure(
             pass
         except Exception as exc:
             log.warning("termstructure pump error: %s", exc)
+
+    task = asyncio.create_task(pump())
+    return lambda: task.cancel()
+
+
+# ---------- M3.9 bucketed historic-fit conversations ----------
+
+
+async def _subscribe_smile_buckets(
+    ws: WebSocket, adapter: DeribitAdapter, msg: dict, conversation_id: str,
+) -> Callable[[], None]:
+    """Hourly-bucket smile fits across `lookback_ms`. Emits a snapshot at
+    open, then a `smile_bucket_append` on every chain poll (re-fits the
+    in-progress head bucket and tags `is_new_bucket=True` on the first poll
+    past an hour boundary). On calendar-rev change, wkg-basis subscriptions
+    re-emit a fresh `smile_buckets_snapshot` under the new rev (M3.9d) so
+    the consumer redraws without remount; cal-basis subscriptions don't
+    depend on rev and skip the re-emit."""
+    currency = str(msg.get("currency") or "")
+    expiry = str(msg.get("expiry") or "")
+    methodology = str(msg.get("methodology") or "sabr-naive")
+    raw_ts = msg.get("termStructure")
+    ts_method: str | None = str(raw_ts) if raw_ts else None
+    try:
+        lookback_ms = int(msg.get("lookbackMs") or 0)
+    except (TypeError, ValueError):
+        lookback_ms = 0
+    if not currency or not expiry or lookback_ms <= 0:
+        await ws.send_text(json.dumps({
+            "type": "error", "conversationId": conversation_id,
+            "message": "subscribe_smile_buckets requires currency, expiry, lookbackMs>0",
+        }))
+        return lambda: None
+
+    calibrator = get_calibrator(methodology)
+    if calibrator is None:
+        await ws.send_text(json.dumps({
+            "type": "error", "conversationId": conversation_id,
+            "message": f"unknown methodology: {methodology}",
+        }))
+        return lambda: None
+    if calibrator.requires_ts and not ts_method:
+        await ws.send_text(json.dumps({
+            "type": "error", "conversationId": conversation_id,
+            "message": f"methodology {methodology} requires termStructure",
+        }))
+        return lambda: None
+
+    is_wkg = calibrator.time_basis == "wkg"
+
+    async def pump() -> None:
+        last_seen_floor: int | None = None
+        last_rev: str | None = None
+        try:
+            # Initial snapshot — full lookback window.
+            buckets = adapter.smile_buckets(
+                currency, expiry, methodology, ts_method, lookback_ms,
+            )
+            last_seen_floor = adapter.latest_bucket_floor()
+            last_rev = vol_time.calendar_rev(vol_time.get_active_calendar())
+            await ws.send_text(json.dumps({
+                "type": "smile_buckets_snapshot",
+                "conversationId": conversation_id,
+                "data": {
+                    "currency": currency,
+                    "expiry": expiry,
+                    "methodology": methodology,
+                    "termStructure": ts_method,
+                    "lookbackMs": lookback_ms,
+                    "calendar_rev": last_rev,
+                    "buckets": [
+                        {"bucket_ts": bts, "fit": _fit_dict(f) if f else None}
+                        for bts, f in buckets
+                    ],
+                },
+            }))
+
+            async for _snap in adapter.chain_stream(currency):
+                current_rev = vol_time.calendar_rev(vol_time.get_active_calendar())
+                current_floor = adapter.latest_bucket_floor()
+
+                # Calendar recalibrate detection (M3.9d). Wkg-basis fits
+                # depend on calendar_rev, so on rev change re-emit the
+                # full snapshot under the new rev; cache misses on the
+                # stale entries naturally trigger recompute on access.
+                # Cal-basis methodologies don't depend on rev — skip.
+                if is_wkg and last_rev is not None and current_rev != last_rev:
+                    buckets = adapter.smile_buckets(
+                        currency, expiry, methodology, ts_method, lookback_ms,
+                    )
+                    await ws.send_text(json.dumps({
+                        "type": "smile_buckets_snapshot",
+                        "conversationId": conversation_id,
+                        "data": {
+                            "currency": currency,
+                            "expiry": expiry,
+                            "methodology": methodology,
+                            "termStructure": ts_method,
+                            "lookbackMs": lookback_ms,
+                            "calendar_rev": current_rev,
+                            "buckets": [
+                                {"bucket_ts": bts, "fit": _fit_dict(f) if f else None}
+                                for bts, f in buckets
+                            ],
+                        },
+                    }))
+                    last_rev = current_rev
+                    last_seen_floor = current_floor
+                    continue
+
+                last_rev = current_rev
+                # Re-fit the head bucket on every poll inside the hour
+                # (so the in-progress current bucket reflects the latest
+                # chain state). Emit a new bucket on the first poll past
+                # an hour boundary.
+                head_fit = adapter.smile_bucket_fit(
+                    currency, expiry, methodology, ts_method, current_floor,
+                )
+                payload = {
+                    "currency": currency,
+                    "expiry": expiry,
+                    "methodology": methodology,
+                    "termStructure": ts_method,
+                    "calendar_rev": current_rev,
+                    "bucket_ts": current_floor,
+                    "fit": _fit_dict(head_fit) if head_fit else None,
+                    "is_new_bucket": last_seen_floor is not None
+                                     and current_floor > last_seen_floor,
+                }
+                last_seen_floor = current_floor
+                await ws.send_text(json.dumps({
+                    "type": "smile_bucket_append",
+                    "conversationId": conversation_id,
+                    "data": payload,
+                }))
+        except (asyncio.CancelledError, WebSocketDisconnect):
+            pass
+        except Exception as exc:
+            log.warning("smile_buckets pump error: %s", exc)
+
+    task = asyncio.create_task(pump())
+    return lambda: task.cancel()
+
+
+async def _subscribe_termstructure_buckets(
+    ws: WebSocket, adapter: DeribitAdapter, msg: dict, conversation_id: str,
+) -> Callable[[], None]:
+    """Hourly-bucket TS snapshots across `lookback_ms`. Same shape as
+    `_subscribe_smile_buckets` but for term-structure curves."""
+    currency = str(msg.get("currency") or "")
+    method = str(msg.get("method") or "")
+    try:
+        lookback_ms = int(msg.get("lookbackMs") or 0)
+    except (TypeError, ValueError):
+        lookback_ms = 0
+    if not currency or not method or lookback_ms <= 0:
+        await ws.send_text(json.dumps({
+            "type": "error", "conversationId": conversation_id,
+            "message": "subscribe_termstructure_buckets requires currency, method, lookbackMs>0",
+        }))
+        return lambda: None
+    builder = get_curve_builder(method)
+    if builder is None:
+        await ws.send_text(json.dumps({
+            "type": "error", "conversationId": conversation_id,
+            "message": f"unknown term-structure method: {method}",
+        }))
+        return lambda: None
+
+    is_wkg = builder.time_basis == "wkg"
+
+    async def pump() -> None:
+        last_seen_floor: int | None = None
+        last_rev: str | None = None
+        try:
+            buckets = adapter.term_structure_buckets(currency, method, lookback_ms)
+            last_seen_floor = adapter.latest_bucket_floor()
+            last_rev = vol_time.calendar_rev(vol_time.get_active_calendar())
+            await ws.send_text(json.dumps({
+                "type": "termstructure_buckets_snapshot",
+                "conversationId": conversation_id,
+                "data": {
+                    "currency": currency,
+                    "method": method,
+                    "lookbackMs": lookback_ms,
+                    "calendar_rev": last_rev,
+                    "buckets": [
+                        {"bucket_ts": bts, "snapshot": _ts_dict(s) if s else None}
+                        for bts, s in buckets
+                    ],
+                },
+            }))
+
+            async for _snap in adapter.chain_stream(currency):
+                current_rev = vol_time.calendar_rev(vol_time.get_active_calendar())
+                current_floor = adapter.latest_bucket_floor()
+
+                # Wkg-basis curve depends on calendar_rev — on rev change
+                # re-emit the full snapshot under the new rev (M3.9d).
+                if is_wkg and last_rev is not None and current_rev != last_rev:
+                    buckets = adapter.term_structure_buckets(currency, method, lookback_ms)
+                    await ws.send_text(json.dumps({
+                        "type": "termstructure_buckets_snapshot",
+                        "conversationId": conversation_id,
+                        "data": {
+                            "currency": currency,
+                            "method": method,
+                            "lookbackMs": lookback_ms,
+                            "calendar_rev": current_rev,
+                            "buckets": [
+                                {"bucket_ts": bts, "snapshot": _ts_dict(s) if s else None}
+                                for bts, s in buckets
+                            ],
+                        },
+                    }))
+                    last_rev = current_rev
+                    last_seen_floor = current_floor
+                    continue
+
+                last_rev = current_rev
+                head = adapter.term_structure_bucket_fit(currency, method, current_floor)
+                payload = {
+                    "currency": currency,
+                    "method": method,
+                    "calendar_rev": current_rev,
+                    "bucket_ts": current_floor,
+                    "snapshot": _ts_dict(head) if head else None,
+                    "is_new_bucket": last_seen_floor is not None
+                                     and current_floor > last_seen_floor,
+                }
+                last_seen_floor = current_floor
+                await ws.send_text(json.dumps({
+                    "type": "termstructure_bucket_append",
+                    "conversationId": conversation_id,
+                    "data": payload,
+                }))
+        except (asyncio.CancelledError, WebSocketDisconnect):
+            pass
+        except Exception as exc:
+            log.warning("termstructure_buckets pump error: %s", exc)
 
     task = asyncio.create_task(pump())
     return lambda: task.cancel()

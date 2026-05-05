@@ -15,6 +15,7 @@ import './busService';
 import './calendarService';
 import './methodologyService';
 import './termstructureService';
+import './bucketsService';
 
 const BACKEND_WS = 'ws://localhost:8000/ws/oracle';
 

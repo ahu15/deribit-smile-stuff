@@ -3,11 +3,17 @@ import { registerWidget, type WidgetProps } from '../shell/widgetRegistry';
 import { chainStream, fetchExpiries, type ChainSnapshot } from '../worker/chainService';
 import {
   fetchHistoricSmile, smileStream,
-  type HistoricSmile, type SmileSnapshot,
+  type HistoricSmile, type SmileSnapshot, type SmileFit,
 } from '../worker/smileService';
 import { fetchMethodologies, type MethodologySpec } from '../worker/methodologyService';
 import { fetchCurveMethods, type CurveMethodSpec } from '../worker/termstructureService';
+import {
+  smileBucketsStream, type SmileBucketEntry,
+} from '../worker/bucketsService';
 import { pickClosestExpiry } from '../shared/expiry';
+import {
+  COMPARE_PALETTE, COMPARE_CAP, CLAMP_WARN_MS, formatRelativeTime,
+} from '../shared/overlayUi';
 
 type Currency = 'BTC' | 'ETH';
 type Mode = 'live' | 'staleFit';
@@ -39,6 +45,14 @@ interface SmileChartConfig {
   // clip the plot to a hand-picked range. Stored in the profile.
   xMin: number | null;
   xMax: number | null;
+  // M3.9 — overlay the last N hourly-bucket fits behind the live curve,
+  // color-faded by age. 0 = off. Bounded at 24 (the HistoryStore cap).
+  historyOverlayHours: number;
+  // M3.9 — list of methodology ids to render as live overlays alongside
+  // the primary fit. Capped at 4 — visual clutter past that is real and
+  // each adds one upstream backend conversation (refcount-shared with any
+  // other widget on the same key, so the cost stays one fit per slice).
+  compareMethodologies: string[];
 }
 
 const DEFAULT_CONFIG: SmileChartConfig = {
@@ -60,6 +74,8 @@ const DEFAULT_CONFIG: SmileChartConfig = {
   showHistoricMarks: true,
   xMin: null,
   xMax: null,
+  historyOverlayHours: 0,
+  compareMethodologies: [],
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -83,6 +99,14 @@ function SmileChart({ config, onConfigChange }: WidgetProps<SmileChartConfig>) {
   const [historicLoading, setHistoricLoading] = useState(false);
   const [methodologies, setMethodologies] = useState<MethodologySpec[]>([]);
   const [curveMethods, setCurveMethods] = useState<CurveMethodSpec[]>([]);
+  // M3.9 hourly-bucket overlays. Keyed by `bucket_ts` so an `append` envelope
+  // either replaces the in-progress head bucket (same ts as the current
+  // wall-clock floor) or pushes a new one onto the trailing edge.
+  const [historyBuckets, setHistoryBuckets] = useState<SmileBucketEntry[]>([]);
+  // M3.9 cross-methodology overlays — one map slot per active comparison id.
+  // Each subscription is independent; oracle dedup ensures other widgets on
+  // the same key share the upstream conversation (HRT principle 1).
+  const [compareSnaps, setCompareSnaps] = useState<Record<string, SmileSnapshot>>({});
 
   useEffect(() => {
     let cancelled = false;
@@ -194,6 +218,96 @@ function SmileChart({ config, onConfigChange }: WidgetProps<SmileChartConfig>) {
     return () => ctrl.abort();
   }, [config.symbol, config.expiry, needChain]);
 
+  // M3.9 — bucketed history overlay subscription. Live fits at hourly
+  // boundaries; the head bucket updates on every chain poll inside the hour
+  // (so `setHistoryBuckets` runs at chain cadence) and a new bucket lands
+  // when the wall-clock crosses an hour boundary.
+  useEffect(() => {
+    if (!config.expiry || config.historyOverlayHours <= 0) {
+      setHistoryBuckets([]);
+      return;
+    }
+    // Clear stale buckets synchronously on every effect run so a methodology
+    // / termStructure / expiry switch doesn't leave the previous selection's
+    // bucket curves in state until the first new snapshot arrives — old data
+    // mixed with new live state was making the chart look broken until the
+    // next chain poll filled in.
+    setHistoryBuckets([]);
+    const ctrl = new AbortController();
+    const lookbackMs = config.historyOverlayHours * 60 * 60 * 1000;
+    (async () => {
+      try {
+        for await (const env of smileBucketsStream(
+          config.symbol, config.expiry!,
+          config.methodology, config.termStructure,
+          lookbackMs,
+        )) {
+          if (ctrl.signal.aborted) break;
+          if (env.kind === 'snapshot') {
+            setHistoryBuckets(env.buckets);
+          } else {
+            // append: replace head if same bucket_ts, else push.
+            setHistoryBuckets(prev => {
+              const last = prev[prev.length - 1];
+              const next = { bucket_ts: env.bucket_ts, fit: env.fit };
+              if (last && last.bucket_ts === env.bucket_ts) {
+                return [...prev.slice(0, -1), next];
+              }
+              return [...prev, next];
+            });
+          }
+        }
+      } catch {
+        // Overlay is optional — failure shouldn't crash the chart.
+      }
+    })();
+    return () => ctrl.abort();
+  }, [
+    config.symbol, config.expiry, config.methodology, config.termStructure,
+    config.historyOverlayHours,
+  ]);
+
+  // M3.9 — cross-methodology comparison subscriptions. Open one
+  // `smileStream` per id in `compareMethodologies`; resolve each
+  // methodology's auto-linked TS curve so its fit lands as well-defined
+  // (alpha-from-ts requires a curve in the matching basis). Cleanup
+  // teardown drops all conversations together, then the effect re-runs
+  // with the new id list.
+  useEffect(() => {
+    if (!config.expiry || config.compareMethodologies.length === 0) {
+      setCompareSnaps({});
+      return;
+    }
+    const ids = config.compareMethodologies.slice(0, COMPARE_CAP);
+    const ctrls: AbortController[] = [];
+    setCompareSnaps({});
+    for (const id of ids) {
+      const m = methodologies.find(x => x.id === id);
+      // If the catalog hasn't loaded yet, skip; the effect re-runs once it
+      // populates (since `methodologies` is in the dep array).
+      if (!m) continue;
+      const ts = m.requires_ts ? `ts_atm_dmr_${m.time_basis}` : null;
+      const ctrl = new AbortController();
+      ctrls.push(ctrl);
+      (async () => {
+        try {
+          for await (const s of smileStream(
+            config.symbol, config.expiry!, id, ts,
+          )) {
+            if (ctrl.signal.aborted) break;
+            setCompareSnaps(prev => ({ ...prev, [id]: s }));
+          }
+        } catch {
+          // Comparison overlays are optional — silent failure is fine.
+        }
+      })();
+    }
+    return () => { for (const c of ctrls) c.abort(); };
+  }, [
+    config.symbol, config.expiry,
+    config.compareMethodologies, methodologies,
+  ]);
+
   // Historic SABR fit — one-shot, oracle-routed (HRT principle 1: tabs never
   // hit FastAPI directly). Fires whenever as-of moves or the user toggles
   // historic on; the curve is intentionally static between fires.
@@ -228,12 +342,14 @@ function SmileChart({ config, onConfigChange }: WidgetProps<SmileChartConfig>) {
         snap={snap}
         historic={historic}
         historicLoading={historicLoading}
+        requestedAsOfMs={effectiveAsOfMs}
         onToggleSettings={() => setShowSettings(v => !v)}
       />
       {showSettings && (
         <SettingsPanel
           config={config}
           onConfigChange={onConfigChange}
+          methodologies={methodologies}
           historic={historic}
           historicAsOfMs={effectiveAsOfMs}
           historicAsOfOverridden={historicAsOfOverride != null}
@@ -247,6 +363,9 @@ function SmileChart({ config, onConfigChange }: WidgetProps<SmileChartConfig>) {
         <SmilePlot
           snap={snap}
           historic={historic}
+          historyBuckets={historyBuckets}
+          compareSnaps={compareSnaps}
+          methodologies={methodologies}
           chainSnap={
             chainSnap && chainSnap.expiry === config.expiry ? chainSnap : null
           }
@@ -268,6 +387,7 @@ interface ToolbarProps {
   snap: SmileSnapshot | null;
   historic: HistoricSmile | null;
   historicLoading: boolean;
+  requestedAsOfMs: number;
   onToggleSettings: () => void;
 }
 
@@ -297,7 +417,8 @@ function findMethodology(
 
 function Toolbar({
   config, onConfigChange, expiries, methodologies, curveMethods,
-  selectedMethodology, snap, historic, historicLoading, onToggleSettings,
+  selectedMethodology, snap, historic, historicLoading, requestedAsOfMs,
+  onToggleSettings,
 }: ToolbarProps) {
   const fit = snap?.fit;
 
@@ -404,9 +525,23 @@ function Toolbar({
           <span style={{ color: 'var(--fg-dim)' }}>frozen</span>
           {historicLoading && ' …'}
           {historic?.snapped_ms != null && (
-            <span style={{ color: 'var(--fg-dim)', fontFamily: 'var(--font-data)' }}>
-              {' @ '}{new Date(historic.snapped_ms).toLocaleString()}
+            <span
+              style={{ color: 'var(--fg-dim)', fontFamily: 'var(--font-data)' }}
+              title={`snapped @ ${new Date(historic.snapped_ms).toLocaleString()}\n`
+                   + `requested @ ${new Date(requestedAsOfMs).toLocaleString()}`}
+            >
+              {' @ '}{formatRelativeTime(historic.snapped_ms, Date.now())}
             </span>
+          )}
+          {historic?.snapped_ms != null
+           && Math.abs(requestedAsOfMs - historic.snapped_ms) > CLAMP_WARN_MS && (
+            <span
+              style={{ color: 'var(--neg)', marginLeft: 4, fontFamily: 'var(--font-data)' }}
+              title={`Request was outside the data buffer — clamped.\n`
+                   + `Requested ${formatRelativeTime(requestedAsOfMs, Date.now())}, `
+                   + `actual ${formatRelativeTime(historic.snapped_ms, Date.now())}.\n`
+                   + `Buffer fills as the backend runs (24h cap).`}
+            >(clamped)</span>
           )}
           {historic && historic.snapped_ms == null && !historicLoading && (
             <span style={{ color: 'var(--bid)' }}>{' '}(no data)</span>
@@ -436,6 +571,7 @@ function Toolbar({
 interface SettingsPanelProps {
   config: SmileChartConfig;
   onConfigChange: (c: SmileChartConfig) => void;
+  methodologies: MethodologySpec[];
   historic: HistoricSmile | null;
   // As-of state is owned by SmileChart, not the persisted config — it always
   // resets to (mount − 24h) on widget mount, with an in-session override.
@@ -461,7 +597,16 @@ function localInputValueToMs(v: string): number | null {
   return Number.isFinite(ms) ? ms : null;
 }
 
-function SettingsPanel({ config, onConfigChange, historic, historicAsOfMs, historicAsOfOverridden, onHistoricAsOfChange, onClose }: SettingsPanelProps) {
+function SettingsPanel({ config, onConfigChange, methodologies, historic, historicAsOfMs, historicAsOfOverridden, onHistoricAsOfChange, onClose }: SettingsPanelProps) {
+  const compareIds = config.compareMethodologies;
+  const toggleCompare = (id: string) => {
+    if (id === config.methodology) return;
+    const has = compareIds.includes(id);
+    let next = has ? compareIds.filter(x => x !== id) : [...compareIds, id];
+    // Cap at COMPARE_CAP — visual clutter past 4 lines is real.
+    next = next.slice(-COMPARE_CAP);
+    onConfigChange({ ...config, compareMethodologies: next });
+  };
   const Toggle = (
     key: 'showCurve' | 'showMark' | 'showBid' | 'showAsk' | 'showHistoric' | 'showHistoricMarks',
     label: string, color?: string,
@@ -552,6 +697,79 @@ function SettingsPanel({ config, onConfigChange, historic, historicAsOfMs, histo
         style={btnStyle}
         disabled={config.xMin == null && config.xMax == null}
       >clear</button>
+      <span style={{ width: 1, height: 14, background: 'var(--bg-2)', margin: '0 4px' }} />
+      <span
+        style={{ color: 'var(--fg-mute)', fontSize: 10, letterSpacing: '0.10em' }}
+        title="Show last N hourly-bucket smile fits behind the live curve, faded by age"
+      >HISTORY</span>
+      <select
+        value={config.historyOverlayHours}
+        onChange={e => onConfigChange({
+          ...config,
+          historyOverlayHours: Number(e.target.value),
+        })}
+        style={selectStyle}
+      >
+        <option value={0}>off</option>
+        <option value={3}>last 3h</option>
+        <option value={6}>last 6h</option>
+        <option value={12}>last 12h</option>
+        <option value={24}>last 24h</option>
+      </select>
+      <span style={{ width: 1, height: 14, background: 'var(--bg-2)', margin: '0 4px' }} />
+      <span
+        style={{ color: 'var(--fg-mute)', fontSize: 10, letterSpacing: '0.10em' }}
+        title={`Cross-methodology overlays (max ${COMPARE_CAP}). Primary methodology is always plotted; toggle other methodologies to overlay their live fits.`}
+      >COMPARE</span>
+      {methodologies.length === 0 ? (
+        <span style={{ color: 'var(--fg-mute)' }}>(loading…)</span>
+      ) : (
+        <details style={{ position: 'relative' }}>
+          <summary style={{ ...btnStyle, listStyle: 'none', cursor: 'pointer', display: 'inline-block' }}>
+            {compareIds.length === 0 ? 'pick…' : `${compareIds.length} selected`}
+          </summary>
+          <div style={{
+            position: 'absolute', top: '100%', left: 0,
+            background: 'var(--bg-1)', border: '1px solid var(--border)',
+            borderRadius: 3, padding: 6, zIndex: 10, minWidth: 240,
+            maxHeight: 260, overflowY: 'auto',
+          }}>
+            {methodologies.map(m => {
+              const checked = compareIds.includes(m.id);
+              const isPrimary = m.id === config.methodology;
+              const colorIdx = compareIds.indexOf(m.id);
+              const swatch = colorIdx >= 0 ? COMPARE_PALETTE[colorIdx % COMPARE_PALETTE.length] : null;
+              return (
+                <label
+                  key={m.id}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 6,
+                    padding: '2px 0', cursor: isPrimary ? 'default' : 'pointer',
+                    opacity: isPrimary ? 0.4 : 1,
+                  }}
+                  title={isPrimary ? 'this is the primary methodology' : m.id}
+                >
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    disabled={isPrimary || (!checked && compareIds.length >= COMPARE_CAP)}
+                    onChange={() => toggleCompare(m.id)}
+                  />
+                  {swatch && <span style={{ width: 10, height: 2, background: swatch, display: 'inline-block' }} />}
+                  <span style={{ color: 'var(--fg)', fontSize: 11 }}>{m.label}</span>
+                  {isPrimary && <span style={{ color: 'var(--fg-mute)', fontSize: 10 }}> (primary)</span>}
+                </label>
+              );
+            })}
+          </div>
+        </details>
+      )}
+      <button
+        onClick={() => onConfigChange({ ...config, compareMethodologies: [] })}
+        style={btnStyle}
+        disabled={compareIds.length === 0}
+        title="Clear comparison overlays"
+      >clear</button>
       <div style={{ flex: 1 }} />
       <button onClick={onClose} style={btnStyle}>done</button>
     </div>
@@ -569,6 +787,9 @@ interface PlotProps {
   snap: SmileSnapshot | null;
   chainSnap: ChainSnapshot | null;
   historic: HistoricSmile | null;
+  historyBuckets: SmileBucketEntry[];
+  compareSnaps: Record<string, SmileSnapshot>;
+  methodologies: MethodologySpec[];
   accent: string;
   config: SmileChartConfig;
 }
@@ -600,7 +821,10 @@ function buildBidAskMap(chainSnap: ChainSnapshot | null): Map<number, PerStrikeQ
   return out;
 }
 
-function SmilePlot({ snap, chainSnap, historic, accent, config }: PlotProps) {
+function SmilePlot({
+  snap, chainSnap, historic, historyBuckets,
+  compareSnaps, methodologies, accent, config,
+}: PlotProps) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const [size, setSize] = useState({ w: 0, h: 0 });
 
@@ -669,6 +893,23 @@ function SmilePlot({ snap, chainSnap, historic, accent, config }: PlotProps) {
         }
       }
     }
+    if (config.historyOverlayHours > 0) {
+      // Skip the head bucket — the live curve already covers that range.
+      for (let h = 0; h < historyBuckets.length - 1; h++) {
+        const f = historyBuckets[h].fit;
+        if (!f) continue;
+        for (let i = 0; i < f.strikes.length; i++) {
+          if (inX(f.strikes[i])) ys.push(f.fitted_iv[i]);
+        }
+      }
+    }
+    for (const id of config.compareMethodologies) {
+      const cs = compareSnaps[id];
+      if (!cs?.fit) continue;
+      for (let i = 0; i < cs.fit.strikes.length; i++) {
+        if (inX(cs.fit.strikes[i])) ys.push(cs.fit.fitted_iv[i]);
+      }
+    }
     // Fallback if every layer is toggled off in the picked window — fit's
     // full y range so the plot still draws axes.
     if (ys.length === 0) ys.push(...fit.fitted_iv, ...fit.market_iv);
@@ -676,7 +917,7 @@ function SmilePlot({ snap, chainSnap, historic, accent, config }: PlotProps) {
     const ymin = Math.min(...ys), ymax = Math.max(...ys);
     const yPad = (ymax - ymin) * 0.1 || 0.01;
     return { xmin, xmax, ymin: Math.max(0, ymin - yPad), ymax: ymax + yPad };
-  }, [fit, histFit, bidAsk, config.showCurve, config.showMark, config.showBid, config.showAsk, config.showHistoricMarks, config.xMin, config.xMax]);
+  }, [fit, histFit, bidAsk, historyBuckets, compareSnaps, config.showCurve, config.showMark, config.showBid, config.showAsk, config.showHistoricMarks, config.historyOverlayHours, config.compareMethodologies, config.xMin, config.xMax]);
 
   const sx = (x: number) => bounds == null
     ? 0
@@ -715,6 +956,62 @@ function SmilePlot({ snap, chainSnap, historic, accent, config }: PlotProps) {
     }
     return d;
   }, [histFit, bounds, innerW, innerH]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Hourly-bucket overlays — drop the most-recent bucket (visually identical
+  // to the live curve), and the buckets we couldn't fit (cold history at
+  // session start). Build one path per remaining bucket, render with an
+  // age-based alpha so the most recent overlay reads strongest. Sorted
+  // oldest-first by `bucket_ts` so newer paints over older.
+  const overlayCurves = useMemo(() => {
+    if (!bounds || config.historyOverlayHours <= 0) return [];
+    const trimmed = historyBuckets.slice(0, -1).filter(b => b.fit != null);
+    if (trimmed.length === 0) return [];
+    return trimmed.map((b, i, arr) => {
+      const fit = b.fit as SmileFit;
+      let started = false;
+      let d = '';
+      for (let j = 0; j < fit.strikes.length; j++) {
+        const k = fit.strikes[j];
+        if (k < bounds.xmin || k > bounds.xmax) { started = false; continue; }
+        const x = sx(k), y = sy(fit.fitted_iv[j]);
+        d += `${started ? 'L' : 'M'}${x.toFixed(2)},${y.toFixed(2)} `;
+        started = true;
+      }
+      // Age-based alpha: oldest at 0.15, newest at 0.65, linear in between.
+      // Single-bucket case clamps to 0.45 so it reads as a soft mid-tone.
+      const t = arr.length === 1 ? 0.5 : i / (arr.length - 1);
+      const opacity = 0.15 + 0.50 * t;
+      return { d, opacity, bucket_ts: b.bucket_ts };
+    });
+  }, [historyBuckets, bounds, innerW, innerH, config.historyOverlayHours]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Cross-methodology overlays — one solid line per active comparison id,
+  // colored from a fixed palette (capped at COMPARE_CAP). Drawn before the
+  // live curve so the primary stroke remains the visual anchor. Filter
+  // out the primary id so a stale saved profile that listed it as a
+  // comparison doesn't render the same curve twice.
+  const compareCurves = useMemo(() => {
+    if (!bounds || config.compareMethodologies.length === 0) return [];
+    const ids = config.compareMethodologies
+      .filter(id => id !== config.methodology)
+      .slice(0, COMPARE_CAP);
+    return ids.map((id, i) => {
+      const cs = compareSnaps[id];
+      if (!cs?.fit) return null;
+      const cfit = cs.fit;
+      let started = false;
+      let d = '';
+      for (let j = 0; j < cfit.strikes.length; j++) {
+        const k = cfit.strikes[j];
+        if (k < bounds.xmin || k > bounds.xmax) { started = false; continue; }
+        const x = sx(k), y = sy(cfit.fitted_iv[j]);
+        d += `${started ? 'L' : 'M'}${x.toFixed(2)},${y.toFixed(2)} `;
+        started = true;
+      }
+      const label = methodologies.find(m => m.id === id)?.label ?? id;
+      return { id, d, color: COMPARE_PALETTE[i % COMPARE_PALETTE.length], label, fit: cfit };
+    }).filter((x): x is { id: string; d: string; color: string; label: string; fit: SmileFit } => x !== null);
+  }, [compareSnaps, methodologies, bounds, config.methodology, config.compareMethodologies, innerW, innerH]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const xTicks = useMemo(() => makeTicks(bounds?.xmin, bounds?.xmax, 6), [bounds]);
   const yTicks = useMemo(() => makeTicks(bounds?.ymin, bounds?.ymax, 5), [bounds]);
@@ -768,6 +1065,18 @@ function SmilePlot({ snap, chainSnap, historic, accent, config }: PlotProps) {
               strokeDasharray="4 3"
             />
           )}
+          {/* Hourly-bucket overlays — theme-adaptive `--fg` (black on
+              light, white on dark) drawn dotted so they read as
+              "historic reference" against the colored live curve. Age-
+              based opacity keeps the most recent reading strongest. */}
+          {overlayCurves.map(c => (
+            <path
+              key={`b-${c.bucket_ts}`}
+              d={c.d} fill="none"
+              stroke="var(--fg)" strokeOpacity={c.opacity}
+              strokeWidth={1} strokeDasharray="1 3"
+            />
+          ))}
           {histPoints.map(p => {
             if (p.strike < bounds.xmin || p.strike > bounds.xmax) return null;
             return (
@@ -779,8 +1088,40 @@ function SmilePlot({ snap, chainSnap, historic, accent, config }: PlotProps) {
               />
             );
           })}
+          {/* Cross-methodology comparison curves — solid 1px lines in
+              palette colors, drawn before the live curve so the primary
+              stroke remains the visual anchor. */}
+          {compareCurves.map(c => (
+            <path
+              key={`c-${c.id}`}
+              d={c.d} fill="none"
+              stroke={c.color} strokeWidth={1}
+              strokeOpacity={0.85}
+            />
+          ))}
           {config.showCurve && (
             <path d={fittedPath} fill="none" stroke={accent} strokeWidth={1.5} />
+          )}
+          {/* Legend pinned top-right of the plot area when comparisons are
+              active. One row per series including the primary live fit. */}
+          {compareCurves.length > 0 && (
+            <g pointerEvents="none">
+              {[
+                {
+                  color: accent,
+                  label: methodologies.find(m => m.id === config.methodology)?.label ?? config.methodology,
+                },
+                ...compareCurves.map(c => ({ color: c.color, label: c.label })),
+              ].map((row, idx) => (
+                <g
+                  key={`leg-${idx}`}
+                  transform={`translate(${size.w - PAD.right - 200}, ${PAD.top + 4 + idx * 12})`}
+                >
+                  <line x1={0} y1={5} x2={14} y2={5} stroke={row.color} strokeWidth={2} />
+                  <text x={18} y={8} fontSize={10} fill="var(--fg-dim)">{row.label}</text>
+                </g>
+              ))}
+            </g>
           )}
           {config.showMark && fit.market_strikes.map((k, i) => {
             if (k < bounds.xmin || k > bounds.xmax) return null;
@@ -908,13 +1249,15 @@ registerWidget<SmileChartConfig>({
   title: 'Smile',
   component: SmileChart,
   defaultConfig: DEFAULT_CONFIG,
-  configVersion: 7,
+  configVersion: 9,
   // v1 → no display toggles. v2 → curve/mark/bid/ask toggles. v3 → adds
   // historic-fit toggles. v4 → adds xMin/xMax strike-axis zoom. v5 → drops
   // historicAsOfMs from the saved config (session-only state). v6 → adds
   // methodology + termStructure (M3.7). v7 → drops volvol-and-alpha-from-ts
   // freeze axis (collapses to alpha-from-ts) and renames the curve method
-  // family from ts_alpha_dmr_*/ts_atm_linear_dmr_* to ts_atm_dmr_*.
+  // family from ts_alpha_dmr_*/ts_atm_linear_dmr_* to ts_atm_dmr_*. v8 →
+  // adds `historyOverlayHours` (M3.9, default off). v9 → adds
+  // `compareMethodologies` (M3.9, default empty).
   migrate: (_fromVersion, oldConfig) => {
     if (!oldConfig || typeof oldConfig !== 'object') return DEFAULT_CONFIG;
     const o = oldConfig as Partial<SmileChartConfig>;
@@ -949,6 +1292,10 @@ registerWidget<SmileChartConfig>({
       showHistoricMarks: o.showHistoricMarks ?? true,
       xMin: o.xMin ?? null,
       xMax: o.xMax ?? null,
+      historyOverlayHours: o.historyOverlayHours ?? 0,
+      compareMethodologies: Array.isArray(o.compareMethodologies)
+        ? o.compareMethodologies.filter(x => typeof x === 'string').slice(0, COMPARE_CAP)
+        : [],
     };
   },
   accentColor: ACCENT.BTC,
