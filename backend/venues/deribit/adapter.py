@@ -82,6 +82,22 @@ class DeribitAdapter(VenueAdapter):
         # TermStructureChart and (later) M4.5's `AnalysisService.fitHistory`.
         self._smile_bucket_cache: dict[SmileBucketKey, FitResult | None] = {}
         self._ts_bucket_cache: dict[TsBucketKey, TermStructureSnapshot | None] = {}
+        # M3.95+ — in-flight Future maps keyed identically to the caches
+        # above. SABR/DMR fits are dispatched via `asyncio.to_thread` so
+        # CPU-bound calibrator work doesn't block the event loop; with the
+        # await between cache-miss and cache-write, two concurrent callers
+        # on the same key would otherwise both miss + both compute. The
+        # in-flight Future lets the second caller await the first's result.
+        # Preserves the "compute at most once per (key, snapshot)" guarantee
+        # under cooperative interleaving.
+        self._fit_inflight: dict[
+            tuple[str, str, str, str | None, int, str], asyncio.Future
+        ] = {}
+        self._ts_inflight: dict[
+            tuple[str, str, int, str], asyncio.Future
+        ] = {}
+        self._smile_bucket_inflight: dict[SmileBucketKey, asyncio.Future] = {}
+        self._ts_bucket_inflight: dict[TsBucketKey, asyncio.Future] = {}
 
     async def start(self) -> None:
         await self._rest.start()
@@ -281,7 +297,7 @@ class DeribitAdapter(VenueAdapter):
         rows.sort(key=lambda r: (expiry_ms(r.expiry) or 0, r.strike, r.option_type))
         return rows
 
-    def smile_fit(
+    async def smile_fit(
         self,
         currency: str,
         expiry: str,
@@ -295,6 +311,14 @@ class DeribitAdapter(VenueAdapter):
         poll (HRT principle 1, backend half of the two-layer dedup).
         For `requires_ts` calibrators, populates `ctx.ts_snapshot` from the
         per-snapshot TS cache (computed lazily on first request).
+
+        The actual `calibrator.fit(ctx)` call is dispatched to a worker
+        thread via `asyncio.to_thread` so CPU-bound SABR/DMR math doesn't
+        block the event loop — without this, a single 200ms SLSQP fit on
+        one pump task stalls every other WS conversation for that long
+        (chain, history, ping, etc.). See BUGS_AND_IMPROVEMENTS.md
+        § Methodology compute throughput for the parallelism floor and the
+        deferred process-pool / driver-pattern follow-ups.
         """
         snap = self._snapshots.get(currency)
         if not snap:
@@ -317,29 +341,56 @@ class DeribitAdapter(VenueAdapter):
         )
         if cache_key in self._fit_cache:
             return self._fit_cache[cache_key]
+        # Another caller is mid-fit on this key — wait for its result rather
+        # than starting a parallel duplicate fit (would defeat the cache).
+        in_flight = self._fit_inflight.get(cache_key)
+        if in_flight is not None:
+            return await in_flight
 
-        ts_snapshot: TermStructureSnapshot | None = None
-        if calibrator.requires_ts and ts_method:
-            ts_snapshot = self.term_structure_fit(currency, ts_method)
+        # Register the in-flight Future BEFORE any await so concurrent callers
+        # see it during the term_structure_fit / to_thread awaits. Without this
+        # the dedup window has a hole — two callers could both pass the
+        # in-flight check and both compute.
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._fit_inflight[cache_key] = future
+        try:
+            ts_snapshot: TermStructureSnapshot | None = None
+            if calibrator.requires_ts and ts_method:
+                ts_snapshot = await self.term_structure_fit(currency, ts_method)
 
-        ctx = FitContext(
-            currency=currency,
-            expiry=expiry,
-            snapshot=snap,
-            t_years_cal=cal_yte(ex_ms, snap.timestamp_ms),
-            t_years_wkg=vol_yte(ex_ms, snap.timestamp_ms, cal),
-            calendar_rev=rev,
-            ts_snapshot=ts_snapshot,
-            history_store=self.history,
-        )
-        result = calibrator.fit(ctx)
+            ctx = FitContext(
+                currency=currency,
+                expiry=expiry,
+                snapshot=snap,
+                t_years_cal=cal_yte(ex_ms, snap.timestamp_ms),
+                t_years_wkg=vol_yte(ex_ms, snap.timestamp_ms, cal),
+                calendar_rev=rev,
+                ts_snapshot=ts_snapshot,
+                history_store=self.history,
+            )
+            result = await asyncio.to_thread(calibrator.fit, ctx)
+        except asyncio.CancelledError:
+            # Cancellation propagates; cancel (don't set_exception) the future
+            # so any rare in-flight consumer is notified and Python doesn't
+            # log "Future exception was never retrieved" when nobody awaits.
+            if not future.done():
+                future.cancel()
+            self._fit_inflight.pop(cache_key, None)
+            raise
+        except BaseException as exc:
+            if not future.done():
+                future.set_exception(exc)
+            self._fit_inflight.pop(cache_key, None)
+            raise
         # Evict stale-snapshot entries on every insert — keeps the dicts
         # bounded by active subscribers × methodologies, not by uptime.
         self._prune_caches(currency, snap.timestamp_ms)
         self._fit_cache[cache_key] = result
+        future.set_result(result)
+        self._fit_inflight.pop(cache_key, None)
         return result
 
-    def term_structure_fit(
+    async def term_structure_fit(
         self, currency: str, method: str,
     ) -> TermStructureSnapshot | None:
         """Build (or return cached) term-structure snapshot for the latest chain.
@@ -347,7 +398,8 @@ class DeribitAdapter(VenueAdapter):
         `method` is a curve-builder id (e.g. `ts_alpha_dmr_cal`). Per-snapshot
         cache shared across all subscribers and across smile calibrators that
         consume the curve via `ctx.ts_snapshot` — one builder run per
-        (currency, method, chain poll, calendar_rev).
+        (currency, method, chain poll, calendar_rev). Builder math runs via
+        `asyncio.to_thread` so the DMR fit doesn't block the loop.
         """
         snap = self._snapshots.get(currency)
         if not snap:
@@ -360,6 +412,9 @@ class DeribitAdapter(VenueAdapter):
         cache_key = (currency, method, snap.timestamp_ms, rev)
         if cache_key in self._ts_cache:
             return self._ts_cache[cache_key]
+        in_flight = self._ts_inflight.get(cache_key)
+        if in_flight is not None:
+            return await in_flight
 
         # Per-expiry t_years in both bases. Skip expiries we can't parse.
         t_cal_by_expiry: dict[str, float] = {}
@@ -382,9 +437,24 @@ class DeribitAdapter(VenueAdapter):
             t_years_wkg_by_expiry=t_wkg_by_expiry,
             calendar_rev=rev,
         )
-        result = builder.build(ctx)
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._ts_inflight[cache_key] = future
+        try:
+            result = await asyncio.to_thread(builder.build, ctx)
+        except asyncio.CancelledError:
+            if not future.done():
+                future.cancel()
+            self._ts_inflight.pop(cache_key, None)
+            raise
+        except BaseException as exc:
+            if not future.done():
+                future.set_exception(exc)
+            self._ts_inflight.pop(cache_key, None)
+            raise
         self._prune_caches(currency, snap.timestamp_ms)
         self._ts_cache[cache_key] = result
+        future.set_result(result)
+        self._ts_inflight.pop(cache_key, None)
         return result
 
     def _prune_caches(self, currency: str, latest_ts: int) -> None:
@@ -402,7 +472,7 @@ class DeribitAdapter(VenueAdapter):
         for k in stale_ts:
             del self._ts_cache[k]
 
-    def historic_smile_fit(
+    async def historic_smile_fit(
         self,
         currency: str,
         expiry: str,
@@ -508,7 +578,7 @@ class DeribitAdapter(VenueAdapter):
         if calibrator.requires_ts:
             if not ts_method:
                 return result
-            ts_snapshot = self.term_structure_bucket_fit(
+            ts_snapshot = await self.term_structure_bucket_fit(
                 currency, ts_method, snapped_ms,
             )
             if ts_snapshot is None:
@@ -523,13 +593,13 @@ class DeribitAdapter(VenueAdapter):
             ts_snapshot=ts_snapshot,
             history_store=self.history,
         )
-        result.fit = calibrator.fit(ctx)
+        result.fit = await asyncio.to_thread(calibrator.fit, ctx)
         result.market_points = list(zip(strikes, ivs))
         result.snapped_ms = snapped_ms
         result.forward = forward
         return result
 
-    def historic_term_structure_fit(
+    async def historic_term_structure_fit(
         self,
         currency: str,
         method: str,
@@ -612,7 +682,8 @@ class DeribitAdapter(VenueAdapter):
             t_years_wkg_by_expiry=t_wkg_by_expiry,
             calendar_rev=rev,
         )
-        return builder.build(ctx), snapped_ms, earliest_ms, latest_ms
+        built = await asyncio.to_thread(builder.build, ctx)
+        return built, snapped_ms, earliest_ms, latest_ms
 
     def _forward_at(self, currency: str, expiry: str, ts_ms: int) -> float | None:
         fwd_samples = self.history.aggregate(currency, f"forward_opt:{expiry}")
@@ -680,7 +751,7 @@ class DeribitAdapter(VenueAdapter):
             marks=synth_marks,
         )
 
-    def smile_bucket_fit(
+    async def smile_bucket_fit(
         self,
         currency: str,
         expiry: str,
@@ -698,7 +769,9 @@ class DeribitAdapter(VenueAdapter):
 
         For `requires_ts` calibrators, recursively asks `term_structure_bucket_fit`
         for the curve at the same bucket boundary — so the historic fit and
-        its TS prior land in the same point in time.
+        its TS prior land in the same point in time. Calibrator math runs
+        via `asyncio.to_thread`; in-flight Future dedups concurrent callers
+        on the same key.
         """
         ex_ms = expiry_ms(expiry)
         if ex_ms is None:
@@ -715,6 +788,9 @@ class DeribitAdapter(VenueAdapter):
         key: SmileBucketKey = (currency, expiry, resolved, ts_method, bucket_ts, rev)
         if key in self._smile_bucket_cache:
             return self._smile_bucket_cache[key]
+        in_flight = self._smile_bucket_inflight.get(key)
+        if in_flight is not None:
+            return await in_flight
 
         synth = self._replay_chain_at(currency, bucket_ts, expiry_filter=expiry)
         if synth is None:
@@ -730,26 +806,43 @@ class DeribitAdapter(VenueAdapter):
             self._smile_bucket_cache[key] = None
             return None
 
-        ts_snapshot: TermStructureSnapshot | None = None
-        if calibrator.requires_ts and ts_method:
-            ts_snapshot = self.term_structure_bucket_fit(currency, ts_method, bucket_ts)
+        # Register the in-flight Future BEFORE the term_structure_bucket_fit /
+        # to_thread awaits so concurrent callers see the dedup slot.
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._smile_bucket_inflight[key] = future
+        try:
+            ts_snapshot: TermStructureSnapshot | None = None
+            if calibrator.requires_ts and ts_method:
+                ts_snapshot = await self.term_structure_bucket_fit(currency, ts_method, bucket_ts)
 
-        ctx = FitContext(
-            currency=currency,
-            expiry=expiry,
-            snapshot=synth,
-            t_years_cal=t_cal,
-            t_years_wkg=t_wkg,
-            calendar_rev=rev,
-            ts_snapshot=ts_snapshot,
-            history_store=self.history,
-        )
-        result = calibrator.fit(ctx)
+            ctx = FitContext(
+                currency=currency,
+                expiry=expiry,
+                snapshot=synth,
+                t_years_cal=t_cal,
+                t_years_wkg=t_wkg,
+                calendar_rev=rev,
+                ts_snapshot=ts_snapshot,
+                history_store=self.history,
+            )
+            result = await asyncio.to_thread(calibrator.fit, ctx)
+        except asyncio.CancelledError:
+            if not future.done():
+                future.cancel()
+            self._smile_bucket_inflight.pop(key, None)
+            raise
+        except BaseException as exc:
+            if not future.done():
+                future.set_exception(exc)
+            self._smile_bucket_inflight.pop(key, None)
+            raise
         evict_old_smile_buckets(self._smile_bucket_cache, _now_ms())
         self._smile_bucket_cache[key] = result
+        future.set_result(result)
+        self._smile_bucket_inflight.pop(key, None)
         return result
 
-    def term_structure_bucket_fit(
+    async def term_structure_bucket_fit(
         self,
         currency: str,
         method: str,
@@ -764,6 +857,9 @@ class DeribitAdapter(VenueAdapter):
         key: TsBucketKey = (currency, method, bucket_ts, rev)
         if key in self._ts_bucket_cache:
             return self._ts_bucket_cache[key]
+        in_flight = self._ts_bucket_inflight.get(key)
+        if in_flight is not None:
+            return await in_flight
 
         synth = self._replay_chain_at(currency, bucket_ts)
         if synth is None:
@@ -790,12 +886,27 @@ class DeribitAdapter(VenueAdapter):
             t_years_wkg_by_expiry=t_wkg_by_expiry,
             calendar_rev=rev,
         )
-        result = builder.build(ctx)
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._ts_bucket_inflight[key] = future
+        try:
+            result = await asyncio.to_thread(builder.build, ctx)
+        except asyncio.CancelledError:
+            if not future.done():
+                future.cancel()
+            self._ts_bucket_inflight.pop(key, None)
+            raise
+        except BaseException as exc:
+            if not future.done():
+                future.set_exception(exc)
+            self._ts_bucket_inflight.pop(key, None)
+            raise
         evict_old_ts_buckets(self._ts_bucket_cache, _now_ms())
         self._ts_bucket_cache[key] = result
+        future.set_result(result)
+        self._ts_bucket_inflight.pop(key, None)
         return result
 
-    def smile_buckets(
+    async def smile_buckets(
         self,
         currency: str,
         expiry: str,
@@ -815,13 +926,13 @@ class DeribitAdapter(VenueAdapter):
             now_ms = _now_ms()
         out: list[tuple[int, FitResult | None]] = []
         for bucket_ts in bucket_boundaries(now_ms, lookback_ms):
-            fit = self.smile_bucket_fit(
+            fit = await self.smile_bucket_fit(
                 currency, expiry, methodology, ts_method, bucket_ts,
             )
             out.append((bucket_ts, fit))
         return out
 
-    def term_structure_buckets(
+    async def term_structure_buckets(
         self,
         currency: str,
         method: str,
@@ -833,7 +944,7 @@ class DeribitAdapter(VenueAdapter):
             now_ms = _now_ms()
         out: list[tuple[int, TermStructureSnapshot | None]] = []
         for bucket_ts in bucket_boundaries(now_ms, lookback_ms):
-            ts = self.term_structure_bucket_fit(currency, method, bucket_ts)
+            ts = await self.term_structure_bucket_fit(currency, method, bucket_ts)
             out.append((bucket_ts, ts))
         return out
 

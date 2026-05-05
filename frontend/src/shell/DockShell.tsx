@@ -24,6 +24,7 @@ import '../widgets/SmileChart';
 import '../widgets/QuickPricer';
 import '../widgets/VolCalendar';
 import '../widgets/TermStructureChart';
+import '../widgets/ModelHealth';
 
 // ---------- panel params ----------
 

@@ -17,11 +17,24 @@ export interface MethodologySpec {
 }
 
 if (isOracleContext) {
+  // Session-long cache: the catalog is build-time constant on the backend,
+  // so the first successful fetch is reused for the rest of the session by
+  // every widget that calls `fetchMethodologies()`. Without this each
+  // widget mount races to its own fetch — `subscribeRemote` only refcount-
+  // shares while the generator is open, and one-shot generators close
+  // immediately after yielding, so concurrent mounts each spin up a fresh
+  // request. A failed fetch clears the cache so the next call retries.
+  let cached: Promise<MethodologySpec[]> | null = null;
   registerService('methodologyCatalog', async function* () {
-    const resp = await fetch('/api/methodologies');
-    if (!resp.ok) throw new Error(`methodologies: ${resp.status}`);
-    const body = (await resp.json()) as { methodologies: MethodologySpec[] };
-    yield body.methodologies;
+    if (!cached) {
+      cached = (async () => {
+        const resp = await fetch('/api/methodologies');
+        if (!resp.ok) throw new Error(`methodologies: ${resp.status}`);
+        const body = (await resp.json()) as { methodologies: MethodologySpec[] };
+        return body.methodologies;
+      })().catch(err => { cached = null; throw err; });
+    }
+    yield await cached;
   });
 }
 

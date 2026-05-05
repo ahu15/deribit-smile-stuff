@@ -154,6 +154,51 @@ Same fix applies to `_subscribe_chain` — new chains also wait a tick to render
 
 ---
 
+## #6 — Methodology compute throughput: process-pool parallelism + driver pattern
+
+**Status:** open (deferred; option 1 shipped)
+**Complexity:** L
+**First observed:** during M3.95 ModelHealth verification — selecting all 16 methodologies populates only ~5 rows within the first chain poll; the heavier weighted calibrators (`atm-manual`, `bidask-spread`, `bidask-spread-sma`) lag significantly behind the 2s poll cadence.
+
+**What's already in place (M3.95).**
+- **Option 1: `asyncio.to_thread` per fit.** Every `calibrator.fit(ctx)` and `builder.build(ctx)` call now runs on Python's default thread pool via `asyncio.to_thread`, so a 200 ms SLSQP fit no longer blocks the event loop. WS frames, ping/health, chain/history streams all stay responsive while ModelHealth's matrix is filling in.
+- **Per-key in-flight `asyncio.Future` dedup.** With the `await` between cache miss and cache write, two concurrent callers on the same key would otherwise both miss + both compute. The new `_fit_inflight` / `_ts_inflight` / `_smile_bucket_inflight` / `_ts_bucket_inflight` maps make the second caller await the first's result, preserving the M3.7 "compute at most once per (key, snapshot)" guarantee.
+- **Frontend mitigations** layered on top: ModelHealth hides methodology rows whose first fit hasn't landed, surfaces a "N methodologies not shown — fits still computing" footer, and drops empty holiday-bucket columns. So the lag is legible rather than mysterious.
+
+**Why it's still listed as `open`.**
+- Option 1 stops the freeze; it doesn't grow throughput. With ~200 unique fit keys per chain poll and ~150 ms average per heavy calibrator, the per-snapshot CPU floor is still ~30 s of work being chewed through serially across thread-pool workers. The GIL means the thread pool gives roughly 1.2–1.8× speedup on multi-core, not Nx — scipy's wrappers around the C kernels hold the GIL for the wrapper code even though numpy/LAPACK release it in their kernels. The user-visible result is "ModelHealth fills in over 5–10 polls" instead of "instantly," which is acceptable for a diagnostic widget but not free.
+
+**Deferred follow-ups (in rough effort order):**
+
+1. **Option 2 — `ProcessPoolExecutor` for fits.** Sidesteps the GIL for true parallelism. ~Nx speedup on N cores for the math itself, but introduces:
+   - `FitContext` / `BuildContext` pickling: today both reference `HistoryStore` (which holds `threading.Lock` instances + deque subscribers, not picklable). Need a "request DTO" that carries only the fields the calibrator actually reads (strikes, IVs, spreads, t, calendar_rev) — clean separation worth doing regardless.
+   - Worker startup cost (~0.5–2s for first numpy/scipy import per worker). Mitigated by long-lived workers + small fixed pool; FastAPI lifespan needs explicit shutdown so `--reload` doesn't leak workers.
+   - Numerical determinism: scipy is mostly deterministic given same input + version, but `curve_fit`'s LM trust region uses RNG for initial perturbation under some bounds configurations. Pin `np.random.seed(0)` per fit or accept that adjacent-poll output is approximately equal but not byte-identical. The plan's "byte-identical M3.5/M3.6 default" guarantee for the uniform path is at risk and needs a deliberate pin.
+   - Worker crashes possible (rare scipy pathologies become process boundary issues). On the upside, isolated — one bad fit doesn't kill the FastAPI process.
+
+2. **Option 3 — Snapshot-driver pattern.** Instead of N pump tasks each independently calling `smile_fit`, have one driver per `(currency, snapshot)` that collects the full set of subscribed `(methodology, expiry, ts_method)` keys, topo-sorts them (TS curves before alpha-from-ts smiles), dispatches the whole batch (sequentially / threadpool / processpool — orthogonal choice), and writes results into the cache. Pump tasks become pure consumers that wake when the driver finishes and serialize their WS frame.
+   - Architecturally cleanest: aligns with the M3.7 plan's "compute at most once per chain poll regardless of how many subscribers want it" intent. Today the dedup is *passive* (cache lookup); with a driver it becomes *active* (driver decides what runs).
+   - Enables batching: 12 methodologies × 13 expiries that share strike/IV data could be vectorized — build the (strike, IV, weight) arrays once, hand the batch to a worker that does N fits in a tight loop without re-pickling per fit. Compounds with option 2 since IPC becomes per-batch instead of per-fit.
+   - Enables priority ordering: live-primary subscribers' fits run before ModelHealth-overlay fits, instead of leaving it to scheduler luck.
+   - Enables explicit backpressure: if the driver can't finish before the next snapshot arrives, drop the oldest snapshot's pending fits and start fresh on the new one — instead of letting 50 backlogged snapshots queue per pump.
+   - Per-fit timeout (`asyncio.wait_for` around each future) becomes natural here — one pathological calibrator stalling the batch is otherwise the worst-case under any of these designs.
+   - Largest refactor: pump task lifecycle splits into "registrar" (declares interest in a key) and "consumer" (awaits driver result for that key on each snapshot). Cancellation, error handling, partial-fit semantics all need redesign.
+
+**Recommended sequencing if/when this becomes load-bearing.** Option 1 → option 3 (driver scaffolding around current sync/threadpool dispatch) → swap option 3's backend from threadpool to processpool. Skipping option 1 and going straight to option 2 leaves the per-fit IPC tax exposed; skipping straight to option 3 is a big refactor with no immediate user-visible win unless option 1 is already in place.
+
+**Other ceilings to keep in mind** (these matter even after options 2 + 3 land):
+
+- **Memory grows quadratically in (subscribers × methodologies × time).** The bucket caches are 24h × hourly × per-(currency, expiry, methodology, ts_method) — already ~80 MB at full ModelHealth fan-out. Pruning is per-snapshot, not size-bounded. A future LRU on bucket count or a total-size limit would matter.
+- **WebSocket fan-out becomes the next bottleneck.** Under option 3's batched-emit pattern, 200+ envelopes per chain poll get JSON-serialized and shipped; `json.dumps` is single-threaded (~30–80 ms), per-connection write buffers can backpressure, and the browser-side oracle has to deserialize and dispatch them all on a single SharedWorker thread. Mitigations: drop unused payload fields (ModelHealth doesn't need `fitted_iv`), use orjson, offload serialization with `to_thread`.
+- **Term-structure prior is a hard serial dependency.** The DMR fit gates every alpha-from-ts cell at the same basis; can't trivially parallelize the SMR-then-DMR warm-start path. Today ~100 ms per TS — if a future builder is heavier (e.g. variance-swap parameterization), this becomes the dominant serial cost.
+- **Cache coherence under recalibrate.** Today's drain happens on the loop thread, synchronous. Under option 2 you can have workers mid-fit on the old rev that finish and write stale-rev entries to cache after the recalibrate completes. Solved cheaply by checking `current_rev` before accepting batch results into the cache (the rev-on-envelope pattern already in place handles the read side).
+- **Tail latency from numerical pathologies.** Occasional `curve_fit` non-convergence triggers SLSQP fallback that takes 2 s instead of 200 ms. Under option 3's batched parallel execution this doesn't help — the batch finishes when its slowest fit finishes. Per-fit timeout that returns null on overrun is necessary if you want bounded per-snapshot wall-clock.
+- **Dev-loop friction** from process-pool startup costs and pickle audits. Workers spawn fresh interpreters and import scipy from disk; iterating on `backend/calibration/*.py` requires worker restarts. Modest, but not zero.
+
+**Next step.** No action until a workload actually requires it. The current "diagnostic widget that fills in over a few polls" UX is acceptable for the present scale (one or two analysts, one or two browser tabs). When a user starts wanting the matrix to update at chain cadence on every poll, or M4.5 / M5 surfaces fan-out comparable in scale to ModelHealth, revisit with the sequencing above.
+
+---
+
 ## Future improvements (deferred)
 
 These are noted for completeness but explicitly *not* on the near-term roadmap. Revisit if the underlying need changes.

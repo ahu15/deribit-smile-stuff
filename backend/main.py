@@ -111,7 +111,7 @@ async def term_structure_historic(currency: str, method: str, as_of_ms: int):
     """One-shot historic term-structure rebuild from `mark_iv` history at
     `as_of_ms`. Frozen-overlay path for `TermStructureChart`."""
     adapter: DeribitAdapter = registry.get("deribit")
-    snap, snapped_ms, earliest_ms, latest_ms = adapter.historic_term_structure_fit(
+    snap, snapped_ms, earliest_ms, latest_ms = await adapter.historic_term_structure_fit(
         currency, method, as_of_ms,
     )
     return {
@@ -183,7 +183,7 @@ async def smile_historic(
     the frozen curve. The frontend calls this once per as-of change.
     """
     adapter: DeribitAdapter = registry.get("deribit")
-    res = adapter.historic_smile_fit(
+    res = await adapter.historic_smile_fit(
         currency, expiry, as_of_ms,
         methodology=methodology, ts_method=term_structure,
     )
@@ -637,7 +637,7 @@ async def _subscribe_smile(
     async def pump() -> None:
         try:
             async for snap in adapter.chain_stream(currency):
-                fit = adapter.smile_fit(currency, expiry, methodology, ts_method)
+                fit = await adapter.smile_fit(currency, expiry, methodology, ts_method)
                 payload = {
                     "currency": currency,
                     "expiry": expiry,
@@ -682,7 +682,7 @@ async def _subscribe_termstructure(
     async def pump() -> None:
         try:
             async for snap in adapter.chain_stream(currency):
-                ts = adapter.term_structure_fit(currency, method)
+                ts = await adapter.term_structure_fit(currency, method)
                 payload = {
                     "currency": currency,
                     "method": method,
@@ -754,7 +754,7 @@ async def _subscribe_smile_buckets(
         last_rev: str | None = None
         try:
             # Initial snapshot — full lookback window.
-            buckets = adapter.smile_buckets(
+            buckets = await adapter.smile_buckets(
                 currency, expiry, methodology, ts_method, lookback_ms,
             )
             last_seen_floor = adapter.latest_bucket_floor()
@@ -786,7 +786,7 @@ async def _subscribe_smile_buckets(
                 # stale entries naturally trigger recompute on access.
                 # Cal-basis methodologies don't depend on rev — skip.
                 if is_wkg and last_rev is not None and current_rev != last_rev:
-                    buckets = adapter.smile_buckets(
+                    buckets = await adapter.smile_buckets(
                         currency, expiry, methodology, ts_method, lookback_ms,
                     )
                     await ws.send_text(json.dumps({
@@ -814,7 +814,7 @@ async def _subscribe_smile_buckets(
                 # (so the in-progress current bucket reflects the latest
                 # chain state). Emit a new bucket on the first poll past
                 # an hour boundary.
-                head_fit = adapter.smile_bucket_fit(
+                head_fit = await adapter.smile_bucket_fit(
                     currency, expiry, methodology, ts_method, current_floor,
                 )
                 payload = {
@@ -874,7 +874,7 @@ async def _subscribe_termstructure_buckets(
         last_seen_floor: int | None = None
         last_rev: str | None = None
         try:
-            buckets = adapter.term_structure_buckets(currency, method, lookback_ms)
+            buckets = await adapter.term_structure_buckets(currency, method, lookback_ms)
             last_seen_floor = adapter.latest_bucket_floor()
             last_rev = vol_time.calendar_rev(vol_time.get_active_calendar())
             await ws.send_text(json.dumps({
@@ -899,7 +899,7 @@ async def _subscribe_termstructure_buckets(
                 # Wkg-basis curve depends on calendar_rev — on rev change
                 # re-emit the full snapshot under the new rev (M3.9d).
                 if is_wkg and last_rev is not None and current_rev != last_rev:
-                    buckets = adapter.term_structure_buckets(currency, method, lookback_ms)
+                    buckets = await adapter.term_structure_buckets(currency, method, lookback_ms)
                     await ws.send_text(json.dumps({
                         "type": "termstructure_buckets_snapshot",
                         "conversationId": conversation_id,
@@ -919,7 +919,7 @@ async def _subscribe_termstructure_buckets(
                     continue
 
                 last_rev = current_rev
-                head = adapter.term_structure_bucket_fit(currency, method, current_floor)
+                head = await adapter.term_structure_bucket_fit(currency, method, current_floor)
                 payload = {
                     "currency": currency,
                     "method": method,
