@@ -9,7 +9,7 @@ import { isOracleContext, registerService, subscribeRemote } from './hrtWorker';
 export interface MethodologySpec {
   id: string;
   family: string;
-  freeze: string;          // "none" | "alpha-from-ts" | "volvol-and-alpha-from-ts"
+  freeze: string;          // "none" | "alpha-from-ts"
   weights: string;         // "uniform" | "atm-manual" | "bidask-spread" | "bidask-spread-sma"
   time_basis: 'cal' | 'wkg';
   requires_ts: boolean;

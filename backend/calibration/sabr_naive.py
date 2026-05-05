@@ -1,18 +1,14 @@
-"""SABR-naive calibrators (M3.7).
+"""SABR no-freeze calibrator (M3.7 + M3.8).
 
-Two cells of the methodology Cartesian product land here:
-  * `sabr_none_uniform_cal` — calendar-time t_years, uniform residual weights.
-  * `sabr_none_uniform_wkg` — wkg-time t_years, uniform residual weights.
+`SabrNaiveCalibrator` covers the freeze=none family. M3.7 shipped two
+cells: `sabr_none_uniform_cal` and `sabr_none_uniform_wkg`. M3.8 widens
+the weights axis: any of `uniform`, `atm-manual`, `bidask-spread`,
+`bidask-spread-sma` is now legal. Uniform is the legacy alias `sabr-naive`'s
+target; the others land via the registry's Cartesian product.
 
-Both wrap `backend.fit.fit_smile` (the math kernel). The wkg variant is the
-only one whose cache key depends on `calendar_rev`; the cal variant is
-calendar-independent (its t_years comes from `cal_yte`, which doesn't read
-the active calendar at all). Adapter caching honors that distinction.
-
-Naive in this context means freeze=none and weights=uniform — no term-
-structure dependency, no per-strike weighting. The "naive SABR" alias
-resolves to `sabr_none_uniform_cal` to preserve the M3.5 / M3.6 behavior
-byte-for-byte.
+The wkg variants are the only ones whose cache key depends on
+`calendar_rev`; the cal variants are calendar-independent (t_years comes
+from `cal_yte`, which doesn't read the active calendar at all).
 """
 
 from __future__ import annotations
@@ -21,14 +17,15 @@ from dataclasses import dataclass
 from typing import Literal
 
 from backend.chain import parse_expiry, parse_strike
-from backend.fit import average_iv_by_strike, fit_smile
+from backend.fit import average_iv_by_strike, fit_smile, fit_smile_frozen
 
+from . import weights as weights_mod
 from .types import FitContext, FitResult
 
 
 @dataclass
 class SabrNaiveCalibrator:
-    """SABR with no frozen params and uniform residual weights."""
+    """SABR with no frozen params; weights variant configurable."""
     methodology: str
     family: str
     freeze: str
@@ -58,11 +55,25 @@ class SabrNaiveCalibrator:
         if t <= 0:
             return None
 
-        raw = fit_smile(forward, t, strikes, ivs, beta=1.0)
+        # Uniform weights → fast path through the unweighted SABR fitter
+        # (preserves M3.5/M3.6 byte-for-byte). Any other weight variant
+        # routes through the generalized frozen-fit code which handles
+        # `sigma=1/w, absolute_sigma=True`.
+        if self.weights == "uniform":
+            raw = fit_smile(forward, t, strikes, ivs, beta=1.0)
+        else:
+            w = weights_mod.compute_weights(
+                self.weights,
+                strikes=strikes, forward=forward, expiry=ctx.expiry,
+                snapshot=snap, history_store=ctx.history_store,
+            )
+            raw = fit_smile_frozen(
+                forward, t, strikes, ivs,
+                beta=1.0, weights=w,
+            )
         if raw is None:
             return None
 
-        weights = [1.0] * len(raw.market_strikes)
         return FitResult(
             kind="sabr",
             methodology=self.methodology,
@@ -81,8 +92,8 @@ class SabrNaiveCalibrator:
             fitted_iv=raw.fitted_iv,
             market_strikes=raw.market_strikes,
             market_iv=raw.market_iv,
-            weights_used=weights,
+            weights_used=raw.weights_used or [1.0] * len(raw.market_strikes),
             residual_rms=raw.residual_rms,
-            weighted_residual_rms=raw.residual_rms,  # uniform → equal
-            frozen=[],
+            weighted_residual_rms=raw.weighted_residual_rms or raw.residual_rms,
+            frozen=raw.frozen or [],
         )

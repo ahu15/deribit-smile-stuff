@@ -13,6 +13,9 @@ from backend.chain import (
 from backend.calibration import (
     FitContext, FitResult, get_calibrator, resolve_alias,
 )
+from backend.curves import (
+    BuildContext, TermStructureSnapshot, get_curve_builder,
+)
 from backend.fit import average_iv_by_strike
 from backend.history import HistoryStore, Sample
 from backend.iv import iv_from_price
@@ -60,9 +63,15 @@ class DeribitAdapter(VenueAdapter):
         # (currency, expiry, methodology, ts_method, snapshot_ts, calendar_rev)
         # per chain poll. Pruned to the latest snapshot's ts on each insert
         # so size stays bounded by `expiries × methodologies × subscribers`.
-        # ts_method is None today (M3.8 lands TS-dependent calibrators).
         self._fit_cache: dict[
             tuple[str, str, str, str | None, int, str], FitResult | None
+        ] = {}
+        # Per-snapshot term-structure cache (M3.8): one TS snapshot per
+        # (currency, ts_method, snapshot_ts, calendar_rev) per chain poll.
+        # Two SmileCharts on the same (curve method, basis) consume the
+        # same upstream TS fit (HRT principle 1, backend half).
+        self._ts_cache: dict[
+            tuple[str, str, int, str], TermStructureSnapshot | None
         ] = {}
 
     async def start(self) -> None:
@@ -260,6 +269,8 @@ class DeribitAdapter(VenueAdapter):
         Dispatches through `backend.calibration.REGISTRY`; per-snapshot cache
         ensures multiple subscribers at the same key hit one fit per chain
         poll (HRT principle 1, backend half of the two-layer dedup).
+        For `requires_ts` calibrators, populates `ctx.ts_snapshot` from the
+        per-snapshot TS cache (computed lazily on first request).
         """
         snap = self._snapshots.get(currency)
         if not snap:
@@ -274,12 +285,18 @@ class DeribitAdapter(VenueAdapter):
         calibrator = get_calibrator(resolved)
         if calibrator is None:
             return None
+        if calibrator.requires_ts and not ts_method:
+            return None
 
         cache_key = (
             currency, expiry, resolved, ts_method, snap.timestamp_ms, rev,
         )
         if cache_key in self._fit_cache:
             return self._fit_cache[cache_key]
+
+        ts_snapshot: TermStructureSnapshot | None = None
+        if calibrator.requires_ts and ts_method:
+            ts_snapshot = self.term_structure_fit(currency, ts_method)
 
         ctx = FitContext(
             currency=currency,
@@ -288,22 +305,78 @@ class DeribitAdapter(VenueAdapter):
             t_years_cal=cal_yte(ex_ms, snap.timestamp_ms),
             t_years_wkg=vol_yte(ex_ms, snap.timestamp_ms, cal),
             calendar_rev=rev,
-            ts_snapshot=None,
+            ts_snapshot=ts_snapshot,
+            history_store=self.history,
         )
         result = calibrator.fit(ctx)
-        # Evict stale-snapshot entries on every insert — keeps the dict
+        # Evict stale-snapshot entries on every insert — keeps the dicts
         # bounded by active subscribers × methodologies, not by uptime.
-        self._prune_fit_cache(currency, snap.timestamp_ms)
+        self._prune_caches(currency, snap.timestamp_ms)
         self._fit_cache[cache_key] = result
         return result
 
-    def _prune_fit_cache(self, currency: str, latest_ts: int) -> None:
-        stale = [
+    def term_structure_fit(
+        self, currency: str, method: str,
+    ) -> TermStructureSnapshot | None:
+        """Build (or return cached) term-structure snapshot for the latest chain.
+
+        `method` is a curve-builder id (e.g. `ts_alpha_dmr_cal`). Per-snapshot
+        cache shared across all subscribers and across smile calibrators that
+        consume the curve via `ctx.ts_snapshot` — one builder run per
+        (currency, method, chain poll, calendar_rev).
+        """
+        snap = self._snapshots.get(currency)
+        if not snap:
+            return None
+        builder = get_curve_builder(method)
+        if builder is None:
+            return None
+        cal = get_active_calendar()
+        rev = calendar_rev(cal)
+        cache_key = (currency, method, snap.timestamp_ms, rev)
+        if cache_key in self._ts_cache:
+            return self._ts_cache[cache_key]
+
+        # Per-expiry t_years in both bases. Skip expiries we can't parse.
+        t_cal_by_expiry: dict[str, float] = {}
+        t_wkg_by_expiry: dict[str, float] = {}
+        for ex in snap.expiries():
+            ex_ms = expiry_ms(ex)
+            if ex_ms is None:
+                continue
+            t_cal = cal_yte(ex_ms, snap.timestamp_ms)
+            t_wkg = vol_yte(ex_ms, snap.timestamp_ms, cal)
+            if t_cal <= 0 or t_wkg <= 0:
+                continue
+            t_cal_by_expiry[ex] = t_cal
+            t_wkg_by_expiry[ex] = t_wkg
+
+        ctx = BuildContext(
+            currency=currency,
+            snapshot=snap,
+            t_years_cal_by_expiry=t_cal_by_expiry,
+            t_years_wkg_by_expiry=t_wkg_by_expiry,
+            calendar_rev=rev,
+        )
+        result = builder.build(ctx)
+        self._prune_caches(currency, snap.timestamp_ms)
+        self._ts_cache[cache_key] = result
+        return result
+
+    def _prune_caches(self, currency: str, latest_ts: int) -> None:
+        """Drop stale-snapshot entries from all per-snapshot caches."""
+        stale_fits = [
             k for k in self._fit_cache
             if k[0] == currency and k[4] != latest_ts
         ]
-        for k in stale:
+        for k in stale_fits:
             del self._fit_cache[k]
+        stale_ts = [
+            k for k in self._ts_cache
+            if k[0] == currency and k[2] != latest_ts
+        ]
+        for k in stale_ts:
+            del self._ts_cache[k]
 
     def historic_smile_fit(
         self,
@@ -402,6 +475,12 @@ class DeribitAdapter(VenueAdapter):
         calibrator = get_calibrator(methodology)
         if calibrator is None:
             return result
+        # Historic fits run on the synthetic snapshot only — TS dependencies
+        # are not replayed (would require historic naive-SABR fits across all
+        # expiries, which the M3.9 bucketed cache will own). For now,
+        # requires_ts methodologies fall through and return result.fit=None.
+        if calibrator.requires_ts:
+            return result
         ctx = FitContext(
             currency=currency,
             expiry=expiry,
@@ -410,12 +489,98 @@ class DeribitAdapter(VenueAdapter):
             t_years_wkg=t_wkg,
             calendar_rev=rev,
             ts_snapshot=None,
+            history_store=self.history,
         )
         result.fit = calibrator.fit(ctx)
         result.market_points = list(zip(strikes, ivs))
         result.snapped_ms = snapped_ms
         result.forward = forward
         return result
+
+    def historic_term_structure_fit(
+        self,
+        currency: str,
+        method: str,
+        as_of_ms: int,
+    ) -> tuple[TermStructureSnapshot | None, int | None, int | None, int | None]:
+        """One-shot TS rebuild from each instrument's `mark_iv` history at
+        `as_of_ms`. Mirrors `historic_smile_fit`'s synthetic-snapshot
+        approach: snap each instrument to its closest sample, build a
+        synthetic ChainSnapshot, route through the requested builder.
+
+        Returns `(snapshot, snapped_ms, earliest_ms, latest_ms)`. The
+        timestamps describe the actual data window the caller's `as_of_ms`
+        snapped into.
+        """
+        snap = self._snapshots.get(currency)
+        if not snap:
+            return None, None, None, None
+        builder = get_curve_builder(method)
+        if builder is None:
+            return None, None, None, None
+
+        # Walk every option in the latest snapshot, snap its mark_iv to
+        # the closest sample to as_of_ms, also snap underlying_price.
+        synth_marks: dict[str, OptionMark] = {}
+        snapped_ms: int | None = None
+        earliest_ms: int | None = None
+        latest_ms: int | None = None
+        for name, mark in snap.marks.items():
+            samples = self.history.series(name, "mark_iv")
+            if not samples:
+                continue
+            if earliest_ms is None or samples[0].ts_ms < earliest_ms:
+                earliest_ms = samples[0].ts_ms
+            if latest_ms is None or samples[-1].ts_ms > latest_ms:
+                latest_ms = samples[-1].ts_ms
+            best_iv = min(samples, key=lambda s: abs(s.ts_ms - as_of_ms))
+            if snapped_ms is None or abs(best_iv.ts_ms - as_of_ms) < abs(snapped_ms - as_of_ms):
+                snapped_ms = best_iv.ts_ms
+            # Forward at the snapped timestamp from the option-implied series.
+            inst_expiry = parse_expiry(name)
+            if inst_expiry is None:
+                continue
+            fwd = self._forward_at(currency, inst_expiry, best_iv.ts_ms) or mark.underlying_price
+            if fwd <= 0:
+                continue
+            synth_marks[name] = OptionMark(
+                instrument_name=name,
+                mark_iv=float(best_iv.value),
+                mark_price=0.0,
+                underlying_price=float(fwd),
+                timestamp_ms=best_iv.ts_ms,
+            )
+
+        if snapped_ms is None or not synth_marks:
+            return None, snapped_ms, earliest_ms, latest_ms
+
+        synth_snap = ChainSnapshot(
+            currency=currency, timestamp_ms=snapped_ms, marks=synth_marks,
+        )
+        cal = get_active_calendar()
+        rev = calendar_rev(cal)
+
+        t_cal_by_expiry: dict[str, float] = {}
+        t_wkg_by_expiry: dict[str, float] = {}
+        for ex in synth_snap.expiries():
+            ex_ms = expiry_ms(ex)
+            if ex_ms is None:
+                continue
+            t_cal = cal_yte(ex_ms, snapped_ms)
+            t_wkg = vol_yte(ex_ms, snapped_ms, cal)
+            if t_cal <= 0 or t_wkg <= 0:
+                continue
+            t_cal_by_expiry[ex] = t_cal
+            t_wkg_by_expiry[ex] = t_wkg
+
+        ctx = BuildContext(
+            currency=currency,
+            snapshot=synth_snap,
+            t_years_cal_by_expiry=t_cal_by_expiry,
+            t_years_wkg_by_expiry=t_wkg_by_expiry,
+            calendar_rev=rev,
+        )
+        return builder.build(ctx), snapped_ms, earliest_ms, latest_ms
 
     def _forward_at(self, currency: str, expiry: str, ts_ms: int) -> float | None:
         fwd_samples = self.history.aggregate(currency, f"forward_opt:{expiry}")

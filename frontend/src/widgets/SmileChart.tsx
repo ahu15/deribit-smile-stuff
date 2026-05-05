@@ -6,6 +6,7 @@ import {
   type HistoricSmile, type SmileSnapshot,
 } from '../worker/smileService';
 import { fetchMethodologies, type MethodologySpec } from '../worker/methodologyService';
+import { fetchCurveMethods, type CurveMethodSpec } from '../worker/termstructureService';
 import { pickClosestExpiry } from '../shared/expiry';
 
 type Currency = 'BTC' | 'ETH';
@@ -81,14 +82,40 @@ function SmileChart({ config, onConfigChange }: WidgetProps<SmileChartConfig>) {
   const [historic, setHistoric] = useState<HistoricSmile | null>(null);
   const [historicLoading, setHistoricLoading] = useState(false);
   const [methodologies, setMethodologies] = useState<MethodologySpec[]>([]);
+  const [curveMethods, setCurveMethods] = useState<CurveMethodSpec[]>([]);
 
   useEffect(() => {
     let cancelled = false;
     fetchMethodologies().then(list => {
       if (!cancelled) setMethodologies(list);
     }).catch(() => {});
+    fetchCurveMethods().then(list => {
+      if (!cancelled) setCurveMethods(list);
+    }).catch(() => {});
     return () => { cancelled = true; };
   }, []);
+
+  // Selected methodology — null until catalog loads. The TS curve is
+  // auto-linked to the calibrator's basis: when freeze=alpha-from-ts, the
+  // prior comes from `ts_atm_dmr_${basis}`. Keeping curve+calibrator on
+  // the same basis is the only well-defined pairing (the prior is sampled
+  // in the curve's basis, so a mismatched lookup pairs values with the
+  // wrong x-grid). Done as a config sync rather than a derived value so
+  // the rest of the pipeline (smileService, historic) stays unchanged.
+  const selectedMethodology = methodologies.find(m => m.id === config.methodology) ?? null;
+  useEffect(() => {
+    if (!selectedMethodology) return;
+    if (!selectedMethodology.requires_ts) {
+      if (config.termStructure != null) {
+        onConfigChange({ ...config, termStructure: null });
+      }
+      return;
+    }
+    const expectedTs = `ts_atm_dmr_${selectedMethodology.time_basis}`;
+    if (config.termStructure !== expectedTs) {
+      onConfigChange({ ...config, termStructure: expectedTs });
+    }
+  }, [selectedMethodology, config, onConfigChange]);
 
   // The default as-of is "24h before this widget mounted" — captured once so
   // re-renders don't drift the default forward. The user can override via the
@@ -196,6 +223,8 @@ function SmileChart({ config, onConfigChange }: WidgetProps<SmileChartConfig>) {
         onConfigChange={onConfigChange}
         expiries={expiriesFromHttp}
         methodologies={methodologies}
+        curveMethods={curveMethods}
+        selectedMethodology={selectedMethodology}
         snap={snap}
         historic={historic}
         historicLoading={historicLoading}
@@ -234,18 +263,69 @@ interface ToolbarProps {
   onConfigChange: (c: SmileChartConfig) => void;
   expiries: string[];
   methodologies: MethodologySpec[];
+  curveMethods: CurveMethodSpec[];
+  selectedMethodology: MethodologySpec | null;
   snap: SmileSnapshot | null;
   historic: HistoricSmile | null;
   historicLoading: boolean;
   onToggleSettings: () => void;
 }
 
-function Toolbar({ config, onConfigChange, expiries, methodologies, snap, historic, historicLoading, onToggleSettings }: ToolbarProps) {
+// Axis decomposition: replace one opaque methodology dropdown with three
+// orthogonal axis pickers (freeze · weights · basis). The methodology id
+// stays the source of truth in the saved config — the toolbar resolves
+// (freeze, weights, basis) → id via the catalog.
+const FREEZE_LABELS: Record<string, string> = {
+  'none': 'free',
+  'alpha-from-ts': 'α from TS',
+};
+const WEIGHTS_LABELS: Record<string, string> = {
+  'uniform': 'uniform',
+  'atm-manual': 'ATM-manual',
+  'bidask-spread': 'bid/ask',
+  'bidask-spread-sma': 'bid/ask (SMA)',
+};
+const BASIS_LABELS: Record<'cal' | 'wkg', string> = { cal: 'cal', wkg: 'wkg' };
+
+function findMethodology(
+  methodologies: MethodologySpec[], freeze: string, weights: string, basis: 'cal' | 'wkg',
+): MethodologySpec | null {
+  return methodologies.find(m =>
+    m.freeze === freeze && m.weights === weights && m.time_basis === basis,
+  ) ?? null;
+}
+
+function Toolbar({
+  config, onConfigChange, expiries, methodologies, curveMethods,
+  selectedMethodology, snap, historic, historicLoading, onToggleSettings,
+}: ToolbarProps) {
   const fit = snap?.fit;
-  // M3.7: methodology dropdown ships two cells (cal vs wkg) of the
-  // sabr-none-uniform row. The TS dropdown is render-only — disabled until
-  // M3.8 lands the TermStructure curve builders.
-  const tsDropdownDisabled = true;
+
+  // Catalog-driven option lists — only show axes the backend actually exposes.
+  const freezes = useMemo(
+    () => Array.from(new Set(methodologies.map(m => m.freeze))),
+    [methodologies],
+  );
+  const weightsList = useMemo(
+    () => Array.from(new Set(methodologies.map(m => m.weights))),
+    [methodologies],
+  );
+  const bases = useMemo(
+    () => Array.from(new Set(methodologies.map(m => m.time_basis))) as ('cal' | 'wkg')[],
+    [methodologies],
+  );
+
+  const setAxis = (
+    next: { freeze?: string; weights?: string; basis?: 'cal' | 'wkg' },
+  ) => {
+    if (!selectedMethodology) return;
+    const f = next.freeze ?? selectedMethodology.freeze;
+    const w = next.weights ?? selectedMethodology.weights;
+    const b = next.basis ?? selectedMethodology.time_basis;
+    const found = findMethodology(methodologies, f, w, b);
+    if (found) onConfigChange({ ...config, methodology: found.id });
+  };
+
   return (
     <div style={{
       display: 'flex', alignItems: 'center', gap: 8,
@@ -268,30 +348,54 @@ function Toolbar({ config, onConfigChange, expiries, methodologies, snap, histor
         {expiries.length === 0 && <option value="">(loading…)</option>}
         {expiries.map(e => <option key={e} value={e}>{e}</option>)}
       </select>
+      {/* Three orthogonal axis dropdowns. The methodology id is computed
+          from (freeze, weights, basis) — single source of truth still
+          lives in `config.methodology`, this is purely the picker UI. */}
       <select
-        value={config.methodology}
-        onChange={e => onConfigChange({ ...config, methodology: e.target.value })}
+        value={selectedMethodology?.freeze ?? ''}
+        onChange={e => setAxis({ freeze: e.target.value })}
         style={selectStyle}
-        title="calibration methodology"
+        title="freeze axis — what's pinned by the term-structure prior"
+        disabled={!selectedMethodology}
       >
-        {/* Always include the active value so an unresolved id still
-            renders rather than blanking the dropdown. */}
-        {!methodologies.some(m => m.id === config.methodology) && (
-          <option value={config.methodology}>{config.methodology}</option>
-        )}
-        {methodologies.map(m => (
-          <option key={m.id} value={m.id}>{m.label}</option>
+        {freezes.map(f => (
+          <option key={f} value={f}>{FREEZE_LABELS[f] ?? f}</option>
         ))}
       </select>
       <select
-        value={config.termStructure ?? ''}
-        onChange={e => onConfigChange({ ...config, termStructure: e.target.value || null })}
-        style={{ ...selectStyle, opacity: tsDropdownDisabled ? 0.5 : 1 }}
-        disabled={tsDropdownDisabled}
-        title="term-structure curve (M3.8)"
+        value={selectedMethodology?.weights ?? ''}
+        onChange={e => setAxis({ weights: e.target.value })}
+        style={selectStyle}
+        title="weights — per-strike weights in the smile fit"
+        disabled={!selectedMethodology}
       >
-        <option value="">— no TS —</option>
+        {weightsList.map(w => (
+          <option key={w} value={w}>{WEIGHTS_LABELS[w] ?? w}</option>
+        ))}
       </select>
+      <select
+        value={selectedMethodology?.time_basis ?? ''}
+        onChange={e => setAxis({ basis: e.target.value as 'cal' | 'wkg' })}
+        style={selectStyle}
+        title="time basis — calendar or working-day vol-time"
+        disabled={!selectedMethodology}
+      >
+        {bases.map(b => (
+          <option key={b} value={b}>{BASIS_LABELS[b]}</option>
+        ))}
+      </select>
+      {/* TS curve is auto-linked to calibrator basis (single basis decision
+          flips both the SABR `t` and the prior). The label is informational
+          — switching the basis dropdown flips this automatically. */}
+      {selectedMethodology?.requires_ts && config.termStructure && (
+        <span
+          style={{ color: 'var(--fg-mute)', fontSize: 10, letterSpacing: '0.05em' }}
+          title="α prior — auto-linked to calibrator basis"
+        >
+          prior: {curveMethods.find(m => m.id === config.termStructure)?.label
+            ?? config.termStructure}
+        </span>
+      )}
       <button onClick={onToggleSettings} style={btnStyle}>settings</button>
       <span style={{ color: 'var(--fg-mute)' }}>· live</span>
       {config.showHistoric && (
@@ -804,19 +908,31 @@ registerWidget<SmileChartConfig>({
   title: 'Smile',
   component: SmileChart,
   defaultConfig: DEFAULT_CONFIG,
-  configVersion: 6,
+  configVersion: 7,
   // v1 → no display toggles. v2 → curve/mark/bid/ask toggles. v3 → adds
   // historic-fit toggles. v4 → adds xMin/xMax strike-axis zoom. v5 → drops
   // historicAsOfMs from the saved config (session-only state). v6 → adds
-  // methodology + termStructure (M3.7); old configs default to the canonical
-  // sabr_none_uniform_cal id, which preserves the pre-M3.7 fit byte-for-byte.
+  // methodology + termStructure (M3.7). v7 → drops volvol-and-alpha-from-ts
+  // freeze axis (collapses to alpha-from-ts) and renames the curve method
+  // family from ts_alpha_dmr_*/ts_atm_linear_dmr_* to ts_atm_dmr_*.
   migrate: (_fromVersion, oldConfig) => {
     if (!oldConfig || typeof oldConfig !== 'object') return DEFAULT_CONFIG;
     const o = oldConfig as Partial<SmileChartConfig>;
-    // Normalize the legacy `sabr-naive` alias to its canonical id so the
-    // toolbar dropdown picks the catalog row rather than the fallback branch.
-    const m = o.methodology;
-    const methodology = !m || m === 'sabr-naive' ? DEFAULT_CONFIG.methodology : m;
+    let methodology = o.methodology ?? DEFAULT_CONFIG.methodology;
+    if (methodology === 'sabr-naive') methodology = DEFAULT_CONFIG.methodology;
+    // Retired freeze axis: collapse to alpha-from-ts, keeping weights+basis.
+    methodology = methodology.replace(
+      'sabr_volvol-and-alpha-from-ts_', 'sabr_alpha-from-ts_',
+    );
+    // Curve method renames.
+    const tsRenames: Record<string, string> = {
+      'ts_alpha_dmr_cal': 'ts_atm_dmr_cal',
+      'ts_alpha_dmr_wkg': 'ts_atm_dmr_wkg',
+      'ts_atm_linear_dmr_cal': 'ts_atm_dmr_cal',
+      'ts_atm_linear_dmr_wkg': 'ts_atm_dmr_wkg',
+    };
+    const ts = o.termStructure;
+    const termStructure = ts && tsRenames[ts] ? tsRenames[ts] : ts ?? null;
     return {
       venue: 'deribit',
       symbol: (o.symbol as Currency) ?? DEFAULT_CONFIG.symbol,
@@ -824,7 +940,7 @@ registerWidget<SmileChartConfig>({
       mode: o.mode ?? DEFAULT_CONFIG.mode,
       intervalMin: o.intervalMin ?? DEFAULT_CONFIG.intervalMin,
       methodology,
-      termStructure: o.termStructure ?? DEFAULT_CONFIG.termStructure,
+      termStructure,
       showCurve: o.showCurve ?? true,
       showMark: o.showMark ?? true,
       showBid: o.showBid ?? false,

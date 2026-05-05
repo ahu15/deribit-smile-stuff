@@ -14,6 +14,7 @@ import './smileService';
 import './busService';
 import './calendarService';
 import './methodologyService';
+import './termstructureService';
 
 const BACKEND_WS = 'ws://localhost:8000/ws/oracle';
 

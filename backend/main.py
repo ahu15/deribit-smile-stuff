@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from backend.calibration import FitResult, get_calibrator, list_methodologies
 from backend.chain import ChainRow
+from backend.curves import TermStructureSnapshot, get_curve_builder, list_curve_methods
 from backend.history import HistoryStore, Sample, TradePrint
 from backend.venues.deribit.adapter import DeribitAdapter
 from backend.venues import registry
@@ -92,6 +93,37 @@ async def get_methodologies():
     across all tabs.
     """
     return {"methodologies": [dataclasses.asdict(m) for m in list_methodologies()]}
+
+
+@app.get("/api/term-structure/methods")
+async def get_term_structure_methods():
+    """Catalog of registered curve-builder methods (M3.8).
+
+    One-shot, mirrors `/api/methodologies`. The TermStructureChart's method
+    dropdown reads from this; the SmileChart's TS dropdown also filters by
+    this catalog (gated on the selected smile methodology's `requires_ts`).
+    """
+    return {"methods": [dataclasses.asdict(m) for m in list_curve_methods()]}
+
+
+@app.get("/api/term-structure/historic")
+async def term_structure_historic(currency: str, method: str, as_of_ms: int):
+    """One-shot historic term-structure rebuild from `mark_iv` history at
+    `as_of_ms`. Frozen-overlay path for `TermStructureChart`."""
+    adapter: DeribitAdapter = registry.get("deribit")
+    snap, snapped_ms, earliest_ms, latest_ms = adapter.historic_term_structure_fit(
+        currency, method, as_of_ms,
+    )
+    return {
+        "currency": currency,
+        "method": method,
+        "as_of_ms": as_of_ms,
+        "snapped_ms": snapped_ms,
+        "earliest_ms": earliest_ms,
+        "latest_ms": latest_ms,
+        "calendar_rev": vol_time.calendar_rev(vol_time.get_active_calendar()),
+        "snapshot": _ts_dict(snap) if snap else None,
+    }
 
 
 @app.post("/api/calendar/recalibrate")
@@ -242,6 +274,11 @@ async def oracle_ws(websocket: WebSocket):
                 conv = str(msg.get("conversationId") or "")
                 if conv:
                     subs[conv] = await _subscribe_smile(websocket, adapter, msg, conv)
+
+            elif mtype == "subscribe_termstructure":
+                conv = str(msg.get("conversationId") or "")
+                if conv:
+                    subs[conv] = await _subscribe_termstructure(websocket, adapter, msg, conv)
 
             elif mtype == "unsubscribe":
                 conv = str(msg.get("conversationId") or "")
@@ -464,6 +501,33 @@ def _row_dict(r: ChainRow) -> dict:
     }
 
 
+def _ts_dict(ts: TermStructureSnapshot) -> dict:
+    """Wire format for TermStructureSnapshot (M3.8). Plain data only —
+    sampled grids + params, no callables (HRT principle 4). The frontend's
+    `TermStructureChart` reconstructs whatever curve it needs from these.
+    """
+    return {
+        "method": ts.method,
+        "currency": ts.currency,
+        "time_basis": ts.time_basis,
+        "t_years_cal_grid": list(ts.t_years_cal_grid),
+        "t_years_wkg_grid": list(ts.t_years_wkg_grid),
+        "atm_vol_grid": list(ts.atm_vol_grid),
+        "alpha_grid": list(ts.alpha_grid),
+        "fwd_var_grid": list(ts.fwd_var_grid),
+        "params": dict(ts.params),
+        "rmse": ts.rmse,
+        "calendar_rev": ts.calendar_rev,
+        "market_t_cal": list(ts.market_t_cal),
+        "market_t_wkg": list(ts.market_t_wkg),
+        "market_atm_vol": list(ts.market_atm_vol),
+        "market_expiries": list(ts.market_expiries),
+        "market_fwd_var": list(ts.market_fwd_var),
+        "market_fwd_var_t_cal": list(ts.market_fwd_var_t_cal),
+        "market_fwd_var_t_wkg": list(ts.market_fwd_var_t_wkg),
+    }
+
+
 def _fit_dict(fit: FitResult) -> dict:
     """Wire format for FitResult (M3.7 tagged-union).
 
@@ -581,6 +645,49 @@ async def _subscribe_smile(
             pass
         except Exception as exc:
             log.warning("smile pump error: %s", exc)
+
+    task = asyncio.create_task(pump())
+    return lambda: task.cancel()
+
+
+async def _subscribe_termstructure(
+    ws: WebSocket, adapter: DeribitAdapter, msg: dict, conversation_id: str,
+) -> Callable[[], None]:
+    currency = str(msg.get("currency") or "")
+    method = str(msg.get("method") or "")
+    if not currency or not method:
+        await ws.send_text(json.dumps({
+            "type": "error", "conversationId": conversation_id,
+            "message": "subscribe_termstructure requires currency and method",
+        }))
+        return lambda: None
+    if get_curve_builder(method) is None:
+        await ws.send_text(json.dumps({
+            "type": "error", "conversationId": conversation_id,
+            "message": f"unknown term-structure method: {method}",
+        }))
+        return lambda: None
+
+    async def pump() -> None:
+        try:
+            async for snap in adapter.chain_stream(currency):
+                ts = adapter.term_structure_fit(currency, method)
+                payload = {
+                    "currency": currency,
+                    "method": method,
+                    "timestamp_ms": snap.timestamp_ms,
+                    "calendar_rev": vol_time.calendar_rev(vol_time.get_active_calendar()),
+                    "snapshot": _ts_dict(ts) if ts else None,
+                }
+                await ws.send_text(json.dumps({
+                    "type": "termstructure_snapshot",
+                    "conversationId": conversation_id,
+                    "data": payload,
+                }))
+        except (asyncio.CancelledError, WebSocketDisconnect):
+            pass
+        except Exception as exc:
+            log.warning("termstructure pump error: %s", exc)
 
     task = asyncio.create_task(pump())
     return lambda: task.cancel()

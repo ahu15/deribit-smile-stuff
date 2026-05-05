@@ -1,20 +1,21 @@
-"""MethodologyRegistry (M3.7).
+"""MethodologyRegistry.
 
-Enumerates smile presets along the four axes from PLAN §M3.6–M3.99:
+Enumerates smile presets along the axes from PLAN §M3.6–M3.99:
   family   ∈ {sabr}
-  freeze   ∈ {none, alpha-from-ts, volvol-and-alpha-from-ts}
+  freeze   ∈ {none, alpha-from-ts}
   weights  ∈ {uniform, atm-manual, bidask-spread, bidask-spread-sma}
   time_basis ∈ {cal, wkg}
 
-Methodology id format is `<family>_<freeze>_<weights>_<time_basis>` (per
-explicit decision: snake-case underscores, time_basis as suffix). The
+Methodology id format is `<family>_<freeze>_<weights>_<time_basis>`. The
 registry build is the full Cartesian product, but only the cells whose
 calibrator is implemented are registered — unknown cells are skipped at
-build time, so M3.8 / M3.9 land variants by adding calibrator factories
-without touching this file's structure.
+build time.
 
 The legacy alias `sabr-naive` resolves to `sabr_none_uniform_cal` to keep
-the pre-M3.7 byte-identical default.
+the pre-M3.7 byte-identical default. The retired
+`volvol-and-alpha-from-ts` freeze axis (dropped: the SABR→TS→SABR cycle
+let the prior inherit the dependent fit's weight scheme, double-counting
+the ATM region) collapses to `alpha-from-ts` for old saved profiles.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from dataclasses import dataclass
 from typing import Callable, Literal
 
 from .calibrator import Calibrator
+from .sabr_alpha_frozen import SabrAlphaFrozenCalibrator
 from .sabr_naive import SabrNaiveCalibrator
 
 
@@ -41,7 +43,7 @@ class MethodologySpec:
 # ---------- registry build ----------
 
 _FAMILIES = ("sabr",)
-_FREEZES = ("none", "alpha-from-ts", "volvol-and-alpha-from-ts")
+_FREEZES = ("none", "alpha-from-ts")
 _WEIGHTS = ("uniform", "atm-manual", "bidask-spread", "bidask-spread-sma")
 _BASES: tuple[Literal["cal", "wkg"], ...] = ("cal", "wkg")
 
@@ -61,27 +63,44 @@ def _label_for(family: str, freeze: str, weights: str, basis: str) -> str:
     return " · ".join(parts)
 
 
-def _sabr_naive_factory(
-    methodology_id: str, basis: Literal["cal", "wkg"],
-) -> Calibrator:
-    return SabrNaiveCalibrator(
-        methodology=methodology_id,
-        family="sabr",
-        freeze="none",
-        weights="uniform",
-        time_basis=basis,
-        requires_ts=False,
-        label=_label_for("sabr", "none", "uniform", basis),
-    )
+def _sabr_naive_factory_for(weights: str) -> CalibratorFactory:
+    def _build(methodology_id: str, basis: Literal["cal", "wkg"]) -> Calibrator:
+        return SabrNaiveCalibrator(
+            methodology=methodology_id,
+            family="sabr",
+            freeze="none",
+            weights=weights,
+            time_basis=basis,
+            requires_ts=False,
+            label=_label_for("sabr", "none", weights, basis),
+        )
+    return _build
 
 
+def _sabr_alpha_frozen_factory_for(weights: str) -> CalibratorFactory:
+    def _build(methodology_id: str, basis: Literal["cal", "wkg"]) -> Calibrator:
+        return SabrAlphaFrozenCalibrator(
+            methodology=methodology_id,
+            family="sabr",
+            freeze="alpha-from-ts",
+            weights=weights,
+            time_basis=basis,
+            requires_ts=True,
+            label=_label_for("sabr", "alpha-from-ts", weights, basis),
+        )
+    return _build
+
+
+# Cartesian product of (freeze × weights) for the SABR family. Adding a new
+# freeze axis or weight variant is one row here; basis variants come from
+# the outer `_BASES` loop.
 _FACTORIES: dict[tuple[str, str, str], CalibratorFactory] = {
-    ("sabr", "none", "uniform"): _sabr_naive_factory,
-    # M3.8 will register additional cells here:
-    # ("sabr", "alpha-from-ts", "uniform"): ...,
-    # ("sabr", "alpha-from-ts", "bidask-spread"): ...,
-    # ("sabr", "volvol-and-alpha-from-ts", "uniform"): ...,
-    # ...
+    ("sabr", freeze, weights): factory_for(weights)
+    for freeze, factory_for in (
+        ("none", _sabr_naive_factory_for),
+        ("alpha-from-ts", _sabr_alpha_frozen_factory_for),
+    )
+    for weights in _WEIGHTS
 }
 
 
@@ -106,10 +125,21 @@ def _build_registry() -> dict[str, Calibrator]:
 REGISTRY: dict[str, Calibrator] = _build_registry()
 
 
-# Legacy alias — keeps M3.5/M3.6 callers working byte-identically.
+# Legacy aliases.
+#  * `sabr-naive` — pre-M3.7, kept for byte-identical legacy fits.
+#  * `sabr_volvol-and-alpha-from-ts_<weights>_<basis>` — retired freeze axis,
+#    collapses to the equivalent `alpha-from-ts` cell. The dependent ν that
+#    used to be pinned now floats free; the prior was always SABR-derived
+#    and weight-coupled, which was the very thing we're removing.
 _ALIASES: dict[str, str] = {
     "sabr-naive": "sabr_none_uniform_cal",
 }
+for _w in _WEIGHTS:
+    for _b in _BASES:
+        _ALIASES[f"sabr_volvol-and-alpha-from-ts_{_w}_{_b}"] = (
+            f"sabr_alpha-from-ts_{_w}_{_b}"
+        )
+del _w, _b
 
 
 def resolve_alias(methodology: str) -> str:

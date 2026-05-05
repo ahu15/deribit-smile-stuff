@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from backend.chain import ChainSnapshot
     from backend.curves import TermStructureSnapshot
+    from backend.history import HistoryStore
 
 
 @dataclass
@@ -73,3 +74,8 @@ class FitContext:
     t_years_wkg: float
     calendar_rev: str
     ts_snapshot: "TermStructureSnapshot | None" = None
+    # Optional HistoryStore reference for weight variants that need spread
+    # SMA history. The bidask-spread-sma weights variant reads from
+    # `history_store.series(name, "spread")`; the simpler weight variants
+    # don't touch this.
+    history_store: "HistoryStore | None" = None
