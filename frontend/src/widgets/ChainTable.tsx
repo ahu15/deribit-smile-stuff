@@ -1,9 +1,18 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { registerWidget, type WidgetProps } from '../shell/widgetRegistry';
 import { chainStream, fetchExpiries, type ChainRow, type ChainSnapshot } from '../worker/chainService';
+import { smileStream, type SmileFit } from '../worker/smileService';
+import { fetchMethodologies, type MethodologySpec } from '../worker/methodologyService';
+import { evaluate as evaluateSmile } from '../calibration';
 import { pickClosestExpiry, sortExpiries } from '../shared/expiry';
+import { findMethodology, termStructureFor } from '../shared/methodology';
 import { busPublish, Topics, type AddLegEvent } from '../worker/busService';
 import { useQuickPricerOpen } from '../hooks/useQuickPricer';
+import { useEffectiveModel } from '../hooks/useDefaultModel';
+import { OverrideModelPicker } from '../components/ModelPicker';
+import { priceBlack76 } from '../shared/black76';
+import { useCurrencyAccent, DEFAULT_BTC_ACCENT } from '../shared/currencyAccent';
+import { useTheme } from '../hooks/useTheme';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Visual spec — Option Chain Visual Spec.md
@@ -24,7 +33,11 @@ type MetricId =
   | 'usd_bid' | 'usd_ask' | 'usd_mark'
   | 'spread' | 'spread_bps'
   | 'change_1h' | 'change_24h' | 'change_iv_1h'
-  | 'oi' | 'vol_24h';
+  | 'oi' | 'vol_24h'
+  // Mark-to-model: model IV at this strike, signed IV residual (mark − model)
+  // in vol points, signed USD premium residual (mark − model premium), and
+  // signed bps-of-forward premium residual.
+  | 'model_iv' | 'iv_resid' | 'usd_resid' | 'bps_resid';
 
 // Built-in column presets — bid/ask/mark/iv with a unit toggle. Coin-priced
 // columns (`bid`/`ask`/`mark`) already read as bps of underlying since
@@ -46,9 +59,14 @@ interface ChainTableConfig {
   // Ordered closest-to-spine first; mirrored on the calls side.
   metrics: MetricId[];
   density: RowDensity;
+  // null = follow the app-wide default model; string = pin this chain to
+  // a specific methodology id (persists across changes to the default).
+  fairCurveOverride: string | null;
+  // Shade the strike spine cell by mark-to-model IV residual sign + magnitude
+  // — cool means the chain is bid above model fair (rich vs model on the
+  // mark price), warm means cheap. Off by default.
+  strikeShadeByModel: boolean;
 }
-
-const ACCENT: Record<Currency, string> = { BTC: '#f7931a', ETH: '#8c8cf7' };
 
 // Default puts-side order, spine-out: BID, MARK, ASK, IV, $BID, $MARK, $ASK, Δ24h, OI.
 // On the calls side, this is mirrored *and* bid/ask are swapped (see
@@ -64,6 +82,8 @@ const DEFAULT_CONFIG: ChainTableConfig = {
   expiry: null,
   metrics: DEFAULT_METRICS,
   density: 'default',
+  fairCurveOverride: null,
+  strikeShadeByModel: false,
 };
 
 const ROW_HEIGHT: Record<RowDensity, number> = { compact: 18, default: 22, comfortable: 28 };
@@ -182,12 +202,12 @@ interface MetricDef {
   label: string;     // header label, will render uppercase
   width: number;
   level: 'primary' | 'secondary' | 'tertiary';
-  flashValue: (r: ChainRow | null) => number | null;
+  flashValue: (r: AugmentedChainRow | null) => number | null;
   // Smallest delta worth flashing on. Defaults to 1e-9 (any change). Set to
   // the displayed precision so flashes signal *visible* moves — e.g. 1e-4
   // for 4-decimal coin prices (1 bp), 0.01 for 2-decimal $ prices (1 cent).
   flashEpsilon?: number;
-  render: (r: ChainRow | null) => React.ReactNode;
+  render: (r: AugmentedChainRow | null) => React.ReactNode;
 }
 
 function usdValue(coinPrice: number | null | undefined, fwd: number | null | undefined): number | null {
@@ -301,6 +321,42 @@ const METRIC_DEFS: Record<MetricId, MetricDef> = {
     flashEpsilon: 1,
     render: r => <NumBig value={r?.volume_24h} />,
   },
+  // ─── mark-to-model metrics (M3.99) ───
+  // model_iv: the fair-curve's vol at this strike, rescaled to calendar-T so
+  // it lives in the same basis as Deribit's mark_iv. Renders dim so it
+  // visually anchors as "derived, not a market quote" — `var(--fg-dim)` is
+  // used (rather than `--accent`) because ChainTable overrides `--accent` to
+  // the currency colour, which would visually conflate model with market.
+  model_iv: {
+    id: 'model_iv', label: 'mIV', width: 60, level: 'secondary',
+    flashValue: r => r?.model_iv ?? null,
+    flashEpsilon: IV_EPSILON,
+    render: r => <Num value={r?.model_iv} percent decimals={1} color="var(--fg-dim)" />,
+  },
+  // iv_resid: signed mark_iv − model_iv in vol points. > 0 = mark above model
+  // (rich vs model, easy to short), < 0 = mark below model (cheap vs model).
+  iv_resid: {
+    id: 'iv_resid', label: 'ΔIV', width: 64, level: 'secondary',
+    flashValue: r => r?.iv_resid ?? null,
+    flashEpsilon: IV_EPSILON,
+    render: r => <SignedNum value={r?.iv_resid} percent decimals={2} />,
+  },
+  // usd_resid: signed market − model premium, in USD per contract. > 0 = the
+  // mark is above model fair value in dollar terms.
+  usd_resid: {
+    id: 'usd_resid', label: '$EV', width: 70, level: 'secondary',
+    flashValue: r => r?.usd_resid ?? null,
+    flashEpsilon: USD_PRICE_EPSILON,
+    render: r => <SignedNum value={r?.usd_resid} decimals={2} />,
+  },
+  // bps_resid: signed (mark − model) as bps of forward. Same sign convention
+  // as usd_resid, but unitless across forwards.
+  bps_resid: {
+    id: 'bps_resid', label: 'EVbps', width: 64, level: 'secondary',
+    flashValue: r => r?.bps_resid ?? null,
+    flashEpsilon: 1,
+    render: r => <SignedNum value={r?.bps_resid} decimals={1} />,
+  },
 };
 
 const METRIC_ORDER_FOR_PICKER: MetricId[] = [
@@ -309,13 +365,23 @@ const METRIC_ORDER_FOR_PICKER: MetricId[] = [
   'spread', 'spread_bps',
   'change_1h', 'change_24h', 'change_iv_1h',
   'oi', 'vol_24h',
+  // Model-derived columns — segregated at the end of the picker so the
+  // existing market-quote section reads first.
+  'model_iv', 'iv_resid', 'usd_resid', 'bps_resid',
 ];
+
+// Set of metric ids that depend on the smile fit. Used to gate the smile
+// subscription so chains that don't show a model column or strike shading
+// don't open an unnecessary backend conversation.
+const MODEL_DEPENDENT_METRICS: Set<MetricId> = new Set([
+  'model_iv', 'iv_resid', 'usd_resid', 'bps_resid',
+]);
 
 const FONT_SIZE: Record<'primary' | 'secondary' | 'tertiary', number> = {
   primary: 12, secondary: 11, tertiary: 10,
 };
 
-function bps(r: ChainRow | null): number | null {
+function bps(r: AugmentedChainRow | null): number | null {
   if (!r || r.spread == null || r.mid_price == null || r.mid_price <= 0) return null;
   return (r.spread / r.mid_price) * 10000;
 }
@@ -327,16 +393,75 @@ function swapByIdInPlace(arr: MetricDef[], a: MetricId, b: MetricId): void {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Mark-to-model augmentation. The fair-curve fit feeds per-row model_iv +
+// premium residuals at each strike. Computed once per (chain snapshot, fit
+// snapshot) and merged onto every row regardless of whether the user has the
+// model columns / shading turned on — the cost is tiny (one Hagan eval per
+// strike + one Black-76 eval per option) and keeps strike shading reactive.
+//
+// Basis convention: Deribit posts mark_iv / mark_price under calendar-T, so
+// every model-vs-market quantity surfaced to the user is computed in cal
+// basis. When the methodology was fit under wkg basis the params encode a
+// curve in wkg-σ; total-variance preservation gives σ_cal = σ_wkg · √(T_wkg
+// / T_cal), which leaves Black-76 premium invariant (σ²·T and σ·√T both
+// match). For cal-basis methodologies the rescale collapses to ×1.
+// ─────────────────────────────────────────────────────────────────────────────
+
+type AugmentedChainRow = ChainRow & {
+  model_iv: number | null;       // calendar-T basis, regardless of fit basis
+  iv_resid: number | null;       // mark_iv − model_iv (decimal vol points, signed)
+  usd_resid: number | null;      // mark premium $ − model premium $
+  bps_resid: number | null;      // (mark − model)/F · 1e4
+};
+
+function augmentRowsWithModel(rows: ChainRow[], fit: SmileFit | null): AugmentedChainRow[] {
+  if (!fit || rows.length === 0) {
+    return rows.map(r => ({ ...r, model_iv: null, iv_resid: null, usd_resid: null, bps_resid: null }));
+  }
+  // Single evaluator call per chain — strikes flow through as an array so
+  // SVI / SABR / future kinds share the loop. The eval runs at the fit's own
+  // basis (params were calibrated under fit.t_years); we then rescale to cal
+  // before exposing anything to the user (see header comment).
+  const strikes = rows.map(r => r.strike);
+  const modelIvsBasis = evaluateSmile(fit.kind, fit.params, strikes, fit.forward, fit.t_years);
+  const tCal = fit.t_years_cal;
+  const basisToCal = tCal > 0 && fit.t_years > 0 ? Math.sqrt(fit.t_years / tCal) : NaN;
+  return rows.map((r, i) => {
+    const ivBasis = modelIvsBasis[i];
+    const modelIv = Number.isFinite(ivBasis) && Number.isFinite(basisToCal)
+      ? ivBasis * basisToCal
+      : null;
+    if (modelIv == null || modelIv <= 0 || r.mark_iv == null || !Number.isFinite(r.mark_iv)) {
+      return { ...r, model_iv: modelIv, iv_resid: null, usd_resid: null, bps_resid: null };
+    }
+    const ivResid = r.mark_iv - modelIv;
+    // Premium residual: market mark_price was implied by Deribit under cal-T,
+    // so we price the model leg with cal-T as well. Forward rate = 0 matches
+    // the fitter's convention and keeps mark_price · F = USD premium clean.
+    const cp: 1 | -1 = r.option_type === 'C' ? 1 : -1;
+    const priced = priceBlack76(cp, fit.forward, r.strike, tCal, modelIv, 0);
+    let usdResid: number | null = null;
+    let bpsResid: number | null = null;
+    if (priced && r.mark_price != null && Number.isFinite(r.mark_price) && r.underlying_price > 0) {
+      const markUsd = r.mark_price * r.underlying_price;
+      usdResid = markUsd - priced.premium_fwd;
+      bpsResid = (r.mark_price - priced.premium_fwd / r.underlying_price) * 10000;
+    }
+    return { ...r, model_iv: modelIv, iv_resid: ivResid, usd_resid: usdResid, bps_resid: bpsResid };
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Pair calls + puts at each strike. Output is sorted by strike ascending.
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface PairedRow {
   strike: number;
-  call: ChainRow | null;
-  put: ChainRow | null;
+  call: AugmentedChainRow | null;
+  put: AugmentedChainRow | null;
 }
 
-function pairRows(rows: ChainRow[]): PairedRow[] {
+function pairRows(rows: AugmentedChainRow[]): PairedRow[] {
   const byStrike = new Map<number, PairedRow>();
   for (const r of rows) {
     const slot = byStrike.get(r.strike) ?? { strike: r.strike, call: null, put: null };
@@ -353,9 +478,25 @@ function pairRows(rows: ChainRow[]): PairedRow[] {
 
 function ChainTable({ config, onConfigChange }: WidgetProps<ChainTableConfig>) {
   const [snap, setSnap] = useState<ChainSnapshot | null>(null);
+  const [smileFit, setSmileFit] = useState<SmileFit | null>(null);
+  const [methodologyCatalog, setMethodologyCatalog] = useState<MethodologySpec[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [expiriesFromHttp, setExpiriesFromHttp] = useState<string[]>([]);
   const [showColumns, setShowColumns] = useState(false);
+
+  // Effective methodology = override ?? app-wide default. The catalog is
+  // looked up once per widget mount so we can resolve `requires_ts` without
+  // a re-fetch per render. Auto-link the curve method to the calibrator's
+  // basis (same rule SmileChart uses).
+  const effectiveMethodology = useEffectiveModel(config.fairCurveOverride);
+  useEffect(() => {
+    let cancelled = false;
+    fetchMethodologies().then(list => {
+      if (!cancelled) setMethodologyCatalog(list);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+  const effectiveTs = termStructureFor(findMethodology(methodologyCatalog, effectiveMethodology));
 
   useEffect(() => {
     let cancelled = false;
@@ -397,6 +538,43 @@ function ChainTable({ config, onConfigChange }: WidgetProps<ChainTableConfig>) {
     return () => ctrl.abort();
   }, [config.symbol, config.expiry]);
 
+  // Smile fit subscription — only when the user has the strike-shading toggle
+  // on or has at least one model-dependent column visible. Gated on catalog
+  // load so we don't subscribe with `ts=null` and then re-subscribe with the
+  // real ts a tick later (alpha-from-ts methodologies need the curve id at
+  // first call, otherwise the backend gets a malformed request). The oracle's
+  // refcount-shared key means the live sub is shared with any open SmileChart
+  // on the same (currency, expiry, methodology, ts).
+  const needSmile = useMemo(
+    () => config.strikeShadeByModel || config.metrics.some(m => MODEL_DEPENDENT_METRICS.has(m)),
+    [config.strikeShadeByModel, config.metrics],
+  );
+  const catalogReady = methodologyCatalog.length > 0;
+  useEffect(() => {
+    if (!config.expiry || !needSmile || !catalogReady) {
+      setSmileFit(null);
+      return;
+    }
+    // Drop the previous fit synchronously on every (methodology, ts, expiry)
+    // change so the model column / shading don't render against stale params
+    // until the first new envelope lands.
+    setSmileFit(null);
+    const ctrl = new AbortController();
+    (async () => {
+      try {
+        for await (const s of smileStream(
+          config.symbol, config.expiry!, effectiveMethodology, effectiveTs,
+        )) {
+          if (ctrl.signal.aborted) break;
+          setSmileFit(s.fit);
+        }
+      } catch {
+        // Model layer is optional — failure shouldn't crash the chain table.
+      }
+    })();
+    return () => ctrl.abort();
+  }, [config.symbol, config.expiry, needSmile, catalogReady, effectiveMethodology, effectiveTs]);
+
   const expiries = useMemo(
     () => sortExpiries(new Set<string>([...(snap?.expiries ?? []), ...expiriesFromHttp])),
     [snap?.expiries, expiriesFromHttp],
@@ -412,12 +590,20 @@ function ChainTable({ config, onConfigChange }: WidgetProps<ChainTableConfig>) {
   // stale — gating here avoids a single-frame flash of the wrong chain
   // (and prevents the Mirror's auto-center latch from firing on stale data).
   const data = snap && snap.expiry === config.expiry ? snap : null;
-  const paired = useMemo(() => pairRows(data?.rows ?? []), [data?.rows]);
+  const augmentedRows = useMemo(
+    () => augmentRowsWithModel(data?.rows ?? [], smileFit),
+    [data?.rows, smileFit],
+  );
+  const paired = useMemo(() => pairRows(augmentedRows), [augmentedRows]);
   const forward = paired[0]?.call?.underlying_price ?? paired[0]?.put?.underlying_price ?? null;
 
-  const accent = ACCENT[config.symbol];
+  const accent = useCurrencyAccent(config.symbol);
   const rowH = ROW_HEIGHT[config.density];
   const pricerOpen = useQuickPricerOpen();
+  // Light mode pales `--bg-2`, so the diverging shade needs a softer ceiling
+  // to keep it from overwhelming the strike text — mirrors the alpha ratio
+  // between `--flash-up`/`--flash-down` in dark vs light themes.
+  const shadeMaxAlpha = useTheme().theme === 'dark' ? 0.55 : 0.40;
 
   // Index of the first row with strike >= F. Spot line draws between i-1 and i.
   const spotIdx = useMemo(() => {
@@ -450,6 +636,7 @@ function ChainTable({ config, onConfigChange }: WidgetProps<ChainTableConfig>) {
         forward={forward}
         ts={data?.timestamp_ms ?? null}
         onToggleColumns={() => setShowColumns(v => !v)}
+        smileFitReady={smileFit != null}
       />
       {showColumns && (
         <ColumnPicker
@@ -478,6 +665,8 @@ function ChainTable({ config, onConfigChange }: WidgetProps<ChainTableConfig>) {
           rowH={rowH}
           accent={accent}
           pricerOpen={pricerOpen}
+          strikeShadeByModel={config.strikeShadeByModel}
+          shadeMaxAlpha={shadeMaxAlpha}
         />
       )}
     </div>
@@ -495,9 +684,16 @@ interface ToolbarProps {
   forward: number | null;
   ts: number | null;
   onToggleColumns: () => void;
+  smileFitReady: boolean;
 }
 
-function Toolbar({ config, onConfigChange, expiries, forward, ts, onToggleColumns }: ToolbarProps) {
+function Toolbar({ config, onConfigChange, expiries, forward, ts, onToggleColumns, smileFitReady }: ToolbarProps) {
+  // Strike-shading is only meaningful with a fit in hand. We don't disable
+  // the checkbox — the user might toggle it before the fit lands — but show
+  // a hint in the tooltip when there's no fit yet.
+  const shadeTitle = config.strikeShadeByModel && !smileFitReady
+    ? 'Strike shading: waiting for first fit…'
+    : 'Shade strike spine by ΔIV (mark − model). Cool = mark below model (cheap), warm = above (rich).';
   return (
     <div style={{
       display: 'flex', alignItems: 'center', gap: 8,
@@ -521,6 +717,22 @@ function Toolbar({ config, onConfigChange, expiries, forward, ts, onToggleColumn
         {expiries.map(e => <option key={e} value={e}>{e}</option>)}
       </select>
       <button onClick={onToggleColumns} style={btnStyle}>columns</button>
+      <OverrideModelPicker
+        value={config.fairCurveOverride}
+        onChange={id => onConfigChange({ ...config, fairCurveOverride: id })}
+        title="Fair-value model for this chain. Default follows the app-wide model in the header."
+      />
+      <label
+        style={{ display: 'inline-flex', alignItems: 'center', gap: 4, cursor: 'pointer', userSelect: 'none', color: 'var(--fg-dim)' }}
+        title={shadeTitle}
+      >
+        <input
+          type="checkbox"
+          checked={config.strikeShadeByModel}
+          onChange={e => onConfigChange({ ...config, strikeShadeByModel: e.target.checked })}
+        />
+        <span style={{ fontSize: 11 }}>shade K</span>
+      </label>
       <div style={{ flex: 1 }} />
       {forward != null && (
         <span style={{ color: 'var(--fg-dim)' }}>
@@ -628,9 +840,11 @@ interface MirrorProps {
   rowH: number;
   accent: string;
   pricerOpen: boolean;
+  strikeShadeByModel: boolean;
+  shadeMaxAlpha: number;
 }
 
-function Mirror({ rows, metrics, forward, spotIdx, rowH, accent, pricerOpen }: MirrorProps) {
+function Mirror({ rows, metrics, forward, spotIdx, rowH, accent, pricerOpen, strikeShadeByModel, shadeMaxAlpha }: MirrorProps) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportH, setViewportH] = useState(0);
@@ -703,6 +917,8 @@ function Mirror({ rows, metrics, forward, spotIdx, rowH, accent, pricerOpen }: M
                   rowH={rowH}
                   isAtm={spotIdx >= 0 && (idx === spotIdx - 1 || idx === spotIdx)}
                   pricerOpen={pricerOpen}
+                  strikeShadeByModel={strikeShadeByModel}
+                  shadeMaxAlpha={shadeMaxAlpha}
                 />
               );
             })}
@@ -773,11 +989,19 @@ interface RowProps {
   rowH: number;
   isAtm: boolean;
   pricerOpen: boolean;
+  strikeShadeByModel: boolean;
+  shadeMaxAlpha: number;
 }
 
-function Row({ pair, callMetrics, putMetrics, forward, rowH, isAtm, pricerOpen }: RowProps) {
+function Row({ pair, callMetrics, putMetrics, forward, rowH, isAtm, pricerOpen, strikeShadeByModel, shadeMaxAlpha }: RowProps) {
   const callItm = forward != null && pair.strike < forward;
   const putItm = forward != null && pair.strike > forward;
+
+  // Pick whichever side has a finite IV residual — they should agree (the
+  // model is a function of strike only) but in practice the call leg might
+  // be missing while the put has data, or vice versa. Average when both are
+  // present so a noisy single quote doesn't dominate.
+  const ivResid = strikeShadeByModel ? pickIvResid(pair) : null;
 
   // Row no longer carries an ATM tint — that visual conflated "near spot"
   // with "ITM-shaded" (a 78K row with F=76K had its OTM cells appearing
@@ -794,7 +1018,7 @@ function Row({ pair, callMetrics, putMetrics, forward, rowH, isAtm, pricerOpen }
           side="call" pricerOpen={pricerOpen}
         />
       ))}
-      <StrikeCell strike={pair.strike} isAtm={isAtm} />
+      <StrikeCell strike={pair.strike} isAtm={isAtm} ivResid={ivResid} shadeMaxAlpha={shadeMaxAlpha} />
       {putMetrics.map(m => (
         <Cell
           key={`p-${m.id}`} m={m} row={pair.put} itm={putItm}
@@ -805,17 +1029,58 @@ function Row({ pair, callMetrics, putMetrics, forward, rowH, isAtm, pricerOpen }
   );
 }
 
-function StrikeCell({ strike, isAtm }: { strike: number; isAtm: boolean }) {
+function pickIvResid(pair: PairedRow): number | null {
+  const c = pair.call?.iv_resid;
+  const p = pair.put?.iv_resid;
+  if (c != null && p != null) return (c + p) / 2;
+  return c ?? p ?? null;
+}
+
+// Diverging strike-shading. |resid| clamps at 2 vol points (0.02) for the
+// alpha ramp; rich → red, cheap → green; same OKLCH triples as the
+// `--flash-up` / `--flash-down` price-flash colors. `maxAlpha` is theme-
+// supplied so light mode (where `--bg-2` is pale) gets a softer ceiling
+// than dark mode, mirroring the flash-color alpha ratio.
+function strikeShadeFor(ivResid: number | null, maxAlpha: number): string | null {
+  if (ivResid == null || !Number.isFinite(ivResid)) return null;
+  const SAT_AT = 0.02;
+  const a = Math.min(1, Math.abs(ivResid) / SAT_AT);
+  if (a < 0.05) return null;          // dead zone — don't tint near-fair strikes
+  return ivResid > 0
+    ? `oklch(0.66 0.21 25 / ${(a * maxAlpha).toFixed(3)})`
+    : `oklch(0.74 0.18 145 / ${(a * maxAlpha).toFixed(3)})`;
+}
+
+function StrikeCell({
+  strike, isAtm, ivResid, shadeMaxAlpha,
+}: {
+  strike: number; isAtm: boolean; ivResid: number | null; shadeMaxAlpha: number;
+}) {
+  const shade = strikeShadeFor(ivResid, shadeMaxAlpha);
+  // Composite the model-shade on top of the ATM/base bg so the user can still
+  // see which strike is closest to F when shading is on. Three layers from
+  // bottom: base bg-2, optional --atm tint when ATM, then the diverging
+  // shade. CSS background can't accept multiple solid colors — wrap as a
+  // gradient stack instead.
+  const layers: string[] = [];
+  if (shade) layers.push(`linear-gradient(${shade}, ${shade})`);
+  layers.push(isAtm ? 'var(--atm)' : 'var(--bg-2)');
+  const tooltip = ivResid != null
+    ? `ΔIV ${(ivResid * 100).toFixed(2)}%  (${ivResid > 0 ? 'mark above model' : 'mark below model'})`
+    : 'mark vs model — no fit';
   return (
-    <div style={{
-      width: STRIKE_WIDTH, padding: '0 6px',
-      color: 'var(--accent)',
-      textAlign: 'center',
-      borderLeft: '1px solid var(--bg-2)',
-      borderRight: '1px solid var(--bg-2)',
-      background: isAtm ? 'var(--atm)' : 'var(--bg-2)',
-      fontVariantNumeric: 'tabular-nums', fontSize: 12, fontWeight: 500,
-    }}>{formatStrike(strike)}</div>
+    <div
+      title={ivResid != null ? tooltip : undefined}
+      style={{
+        width: STRIKE_WIDTH, padding: '0 6px',
+        color: 'var(--accent)',
+        textAlign: 'center',
+        borderLeft: '1px solid var(--bg-2)',
+        borderRight: '1px solid var(--bg-2)',
+        background: layers.join(', '),
+        fontVariantNumeric: 'tabular-nums', fontSize: 12, fontWeight: 500,
+      }}
+    >{formatStrike(strike)}</div>
   );
 }
 
@@ -848,7 +1113,7 @@ function formatStrike(s: number): string {
 
 interface CellProps {
   m: MetricDef;
-  row: ChainRow | null;
+  row: AugmentedChainRow | null;
   itm: boolean;
   side: 'call' | 'put';
   pricerOpen: boolean;
@@ -1032,17 +1297,24 @@ registerWidget<ChainTableConfig>({
   title: 'Chain',
   component: ChainTable,
   defaultConfig: DEFAULT_CONFIG,
-  configVersion: 3,
+  configVersion: 4,
   // v1 → flat per-strike-rows-of-C/P columns; v2 → mirrored geometry; v3 → adds
   // $-denominated bid/ask/mark metrics (and a chronological dropdown sort, but
-  // that's not a config concern). Migrations preserve the user's existing
-  // metric choices and density, only injecting the USD trio if absent.
+  // that's not a config concern); v4 → per-widget `fairCurveOverride` (null =
+  // follow the app-wide model) + `strikeShadeByModel` toggle + 4 new mark-to-
+  // model metric columns (`model_iv`, `iv_resid`, `usd_resid`, `bps_resid`).
+  // Migrations preserve the user's existing metric choices and density, only
+  // injecting the v3 USD trio if absent.
   migrate: (fromVersion, oldConfig) => {
     if (!oldConfig || typeof oldConfig !== 'object') return DEFAULT_CONFIG;
     const o = oldConfig as Partial<ChainTableConfig> & { columns?: string[] };
     const knownV2: Set<MetricId> = new Set([
       'bid', 'ask', 'mark', 'mid', 'iv', 'spread', 'spread_bps',
       'change_1h', 'change_24h', 'change_iv_1h', 'oi', 'vol_24h',
+    ]);
+    const knownV4Extras: Set<MetricId> = new Set([
+      'usd_bid', 'usd_ask', 'usd_mark',
+      'model_iv', 'iv_resid', 'usd_resid', 'bps_resid',
     ]);
 
     // Recover v2 metric list either from the existing v2 config or from the
@@ -1056,7 +1328,7 @@ registerWidget<ChainTableConfig>({
       metrics = preserve.length > 0 ? preserve : DEFAULT_METRICS;
     } else {
       metrics = (o.metrics ?? DEFAULT_METRICS).filter((id): id is MetricId =>
-        knownV2.has(id as MetricId) || id === 'usd_bid' || id === 'usd_ask' || id === 'usd_mark');
+        knownV2.has(id as MetricId) || knownV4Extras.has(id as MetricId));
     }
 
     // Inject the v3 USD pair if the layout doesn't already include them.
@@ -1070,7 +1342,9 @@ registerWidget<ChainTableConfig>({
       expiry: o.expiry ?? null,
       metrics,
       density: o.density ?? 'default',
+      fairCurveOverride: typeof o.fairCurveOverride === 'string' ? o.fairCurveOverride : null,
+      strikeShadeByModel: !!o.strikeShadeByModel,
     };
   },
-  accentColor: ACCENT.BTC,
+  accentColor: DEFAULT_BTC_ACCENT,
 });

@@ -14,6 +14,7 @@ import { pickClosestExpiry } from '../shared/expiry';
 import {
   COMPARE_PALETTE, COMPARE_CAP, CLAMP_WARN_MS, formatRelativeTime,
 } from '../shared/overlayUi';
+import { useCurrencyAccent, DEFAULT_BTC_ACCENT } from '../shared/currencyAccent';
 
 type Currency = 'BTC' | 'ETH';
 type Mode = 'live' | 'staleFit';
@@ -79,11 +80,6 @@ const DEFAULT_CONFIG: SmileChartConfig = {
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
-
-const ACCENT: Record<Currency, string> = {
-  BTC: '#f7931a',
-  ETH: '#8c8cf7',
-};
 
 // IV is decimal, displayed at ≥1 dp percent, so 0.001 = 0.1 vol point is the
 // smallest visually meaningful move (mirrors ChainTable's IV epsilon).
@@ -328,7 +324,7 @@ function SmileChart({ config, onConfigChange }: WidgetProps<SmileChartConfig>) {
     return () => { cancelled = true; };
   }, [config.symbol, config.expiry, config.showHistoric, effectiveAsOfMs, config.methodology, config.termStructure]);
 
-  const accent = ACCENT[config.symbol];
+  const accent = useCurrencyAccent(config.symbol);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', background: 'var(--bg)', color: 'var(--fg)', fontSize: 11, fontFamily: 'var(--font-data)', fontVariantNumeric: 'tabular-nums' }}>
@@ -1298,5 +1294,5 @@ registerWidget<SmileChartConfig>({
         : [],
     };
   },
-  accentColor: ACCENT.BTC,
+  accentColor: DEFAULT_BTC_ACCENT,
 });

@@ -8,6 +8,7 @@ import type {
 import 'dockview/dist/styles/dockview.css';
 
 import { StatusPill } from '../components/StatusPill';
+import { DefaultModelPicker } from '../components/ModelPicker';
 import { useTheme } from '../hooks/useTheme';
 import { useQuickPricerOpen } from '../hooks/useQuickPricer';
 import { getWidget, allWidgets } from './widgetRegistry';
@@ -339,6 +340,8 @@ function ShellHeader() {
       >
         {theme === 'dark' ? '☀ light' : '☾ dark'}
       </button>
+      <Divider />
+      <DefaultModelPicker />
       <Spacer />
       {widgets.map(w => {
         const isQuickPricer = w.id === 'quickPricer';

@@ -11,6 +11,7 @@ import {
 import {
   COMPARE_PALETTE, COMPARE_CAP, CLAMP_WARN_MS, formatRelativeTime,
 } from '../shared/overlayUi';
+import { useCurrencyAccent, DEFAULT_BTC_ACCENT } from '../shared/currencyAccent';
 
 // M3.8 — live term-structure plot. Method dropdown comes from the curve
 // catalog; x-axis toggles cal/wkg time; y-axis toggles σ_atm | α | fwd-var.
@@ -55,11 +56,6 @@ const DEFAULT_CONFIG: TermStructureChartConfig = {
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
-
-const ACCENT: Record<Currency, string> = {
-  BTC: '#f7931a',
-  ETH: '#8c8cf7',
-};
 
 const Y_LABELS: Record<YAxis, string> = {
   atm_vol: 'σ ATM',
@@ -246,7 +242,7 @@ function TermStructureChart({ config, onConfigChange }: WidgetProps<TermStructur
     return () => { cancelled = true; };
   }, [config.symbol, config.method, config.showHistoric, effectiveAsOfMs]);
 
-  const accent = ACCENT[config.symbol];
+  const accent = useCurrencyAccent(config.symbol);
 
   return (
     <div style={{
@@ -989,5 +985,5 @@ registerWidget<TermStructureChartConfig>({
       : [];
     return { ...DEFAULT_CONFIG, ...o, method, compareMethods };
   },
-  accentColor: ACCENT.BTC,
+  accentColor: DEFAULT_BTC_ACCENT,
 });

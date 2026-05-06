@@ -17,8 +17,13 @@ import {
 } from '../worker/busService';
 import { chainStream, type ChainRow, type ChainSnapshot } from '../worker/chainService';
 import { smileStream, type SmileFit, type SmileSnapshot } from '../worker/smileService';
+import { fetchMethodologies, type MethodologySpec } from '../worker/methodologyService';
 import { parseExpiryMs, parseInstrument } from '../shared/expiry';
-import { priceBlack76, sabrLognormalVol, type PricedLeg } from '../shared/black76';
+import { priceBlack76, type PricedLeg } from '../shared/black76';
+import { evaluate as evaluateSmile } from '../calibration';
+import { findMethodology, termStructureFor } from '../shared/methodology';
+import { useEffectiveModel } from '../hooks/useDefaultModel';
+import { OverrideModelPicker } from '../components/ModelPicker';
 
 const ACCENT = '#9aa6ba';   // neutral; legs may span multiple currencies
 const MS_PER_YEAR = 365 * 24 * 60 * 60 * 1000;
@@ -76,6 +81,9 @@ interface QuickPricerConfig {
   // not preserved across toggles, which keeps Δ/Γ/ν/Θ visually grouped even
   // after the user picks an oddball subset like just `['gamma_dollar']`.
   greekColumns: GreekColId[];
+  // null = follow the app-wide default model; string = pin this widget to
+  // a specific methodology id (persists across changes to the default).
+  fairCurveOverride: string | null;
 }
 
 const GREEK_COL_ORDER: GreekColId[] = [
@@ -99,6 +107,7 @@ const DEFAULT_CONFIG: QuickPricerConfig = {
   perUnit: false,
   taker: false,
   greekColumns: DEFAULT_GREEK_COLS,
+  fairCurveOverride: null,
 };
 
 interface GreekColDef {
@@ -286,22 +295,18 @@ function computeLegRow(
     ? Math.max((expiryMs - nowMs) / MS_PER_YEAR, 0)
     : null;
 
-  // Live vol = screen mode → mark_iv straight from chain row. SABR mode → use
-  // the fitted curve evaluated at this leg's strike. If the SABR feed isn't
-  // ready, fall back to mark_iv so the row still prices.
+  // Live vol = screen mode → mark_iv straight from chain row. Interpolated
+  // mode → evaluate the fitted curve at the leg's strike via the calibration
+  // evaluator (family-agnostic). If the smile feed isn't ready or the fit's
+  // kind is unknown to the evaluator, fall back to mark_iv so the row still
+  // prices.
   let liveVol: number | null = chainRow?.mark_iv ?? null;
-  if (mode === 'interpolated' && smileFit && smileFit.kind === 'sabr'
+  if (mode === 'interpolated' && smileFit
       && parsed && fwd != null && t_years != null && t_years > 0) {
-    // M3.7: fit params live in the tagged-union `params` bag. We narrow on
-    // `kind === 'sabr'` here; future SVI etc. legs would dispatch on a
-    // different branch (or the calibration evaluator table once M3.99
-    // wires the fair-curve readout).
-    const p = smileFit.params;
-    const sabrVol = sabrLognormalVol(
-      parsed.strike, fwd, t_years,
-      p.alpha, p.beta, p.rho, p.volvol,
+    const [v] = evaluateSmile(
+      smileFit.kind, smileFit.params, [parsed.strike], fwd, t_years,
     );
-    if (sabrVol != null && Number.isFinite(sabrVol) && sabrVol > 0) liveVol = sabrVol;
+    if (v != null && Number.isFinite(v) && v > 0) liveVol = v;
   }
 
   // Effective inputs — apply overrides on top of live, then resolve the
@@ -421,13 +426,30 @@ function useChainSnapshots(keys: ExpiryKey[]): Map<string, ChainSnapshot> {
   return snaps;
 }
 
-function useSmileSnapshots(keys: ExpiryKey[]): Map<string, SmileSnapshot> {
+function useSmileSnapshots(
+  keys: ExpiryKey[],
+  methodology: string,
+  termStructure: string | null,
+  ready: boolean,
+): Map<string, SmileSnapshot> {
   const [snaps, setSnaps] = useState<Map<string, SmileSnapshot>>(new Map());
   const depKey = keys.map(keyOf).sort().join(',');
+  // Track previous methodology/ts so we can clear the cache only when the
+  // model changes (which makes prior fits stale) — for keys-only changes
+  // (adding/removing a leg) we keep the wanted entries so the surviving
+  // legs don't flicker to "no model vol" until the next chain poll.
+  // Refs are written before the setSnaps call so the closure sees current.
+  const methRef = useRef(methodology);
+  const tsRef = useRef(termStructure);
   useEffect(() => {
+    if (!ready) return;
     const ctrls: AbortController[] = [];
     const wantedKeys = new Set(keys.map(keyOf));
+    const methChanged = methRef.current !== methodology || tsRef.current !== termStructure;
+    methRef.current = methodology;
+    tsRef.current = termStructure;
     setSnaps(prev => {
+      if (methChanged) return new Map();
       const next = new Map<string, SmileSnapshot>();
       for (const [k, v] of prev) if (wantedKeys.has(k)) next.set(k, v);
       return next;
@@ -437,10 +459,7 @@ function useSmileSnapshots(keys: ExpiryKey[]): Map<string, SmileSnapshot> {
       ctrls.push(ctrl);
       (async () => {
         try {
-          // Canonical id (not the `sabr-naive` alias) so QuickPricer shares
-          // the oracle's WS conversation refcount with any open SmileChart
-          // on the same (currency, expiry) — both end up on one backend fit.
-          for await (const s of smileStream(k.currency, k.expiry, 'sabr_none_uniform_cal', null)) {
+          for await (const s of smileStream(k.currency, k.expiry, methodology, termStructure)) {
             if (ctrl.signal.aborted) break;
             setSnaps(prev => {
               const next = new Map(prev);
@@ -453,7 +472,7 @@ function useSmileSnapshots(keys: ExpiryKey[]): Map<string, SmileSnapshot> {
     }
     return () => { for (const c of ctrls) c.abort(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [depKey]);
+  }, [depKey, methodology, termStructure, ready]);
   return snaps;
 }
 
@@ -513,10 +532,27 @@ function QuickPricer({ instanceId, config, onConfigChange }: WidgetProps<QuickPr
     return () => clearInterval(id);
   }, []);
 
+  // Effective methodology = override ?? app-wide default. Auto-link to the
+  // matching TS curve when the methodology is alpha-from-ts (basis-aligned).
+  const effectiveMethodology = useEffectiveModel(config.fairCurveOverride);
+  const [methodologyCatalog, setMethodologyCatalog] = useState<MethodologySpec[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    fetchMethodologies().then(list => {
+      if (!cancelled) setMethodologyCatalog(list);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+  const effectiveTs = termStructureFor(findMethodology(methodologyCatalog, effectiveMethodology));
+  const catalogReady = methodologyCatalog.length > 0;
+
   const expiryKeys = useMemo(() => uniqueExpiryKeys(config.legs), [config.legs]);
   const chainSnaps = useChainSnapshots(expiryKeys);
   const smileKeys = config.mode === 'interpolated' ? expiryKeys : [];
-  const smileSnaps = useSmileSnapshots(smileKeys);
+  // Hold off subscribing until the catalog lands so an alpha-from-ts
+  // methodology doesn't first call with `ts=null` and then re-subscribe
+  // a tick later.
+  const smileSnaps = useSmileSnapshots(smileKeys, effectiveMethodology, effectiveTs, catalogReady);
 
   const rows = useMemo(() => config.legs.map(leg => {
     const p = parseInstrument(leg.instrumentName);
@@ -567,6 +603,7 @@ function QuickPricer({ instanceId, config, onConfigChange }: WidgetProps<QuickPr
         onClear={() => setLegs([])}
         onToggleGreekPicker={() => setShowGreekPicker(v => !v)}
         greekPickerOpen={showGreekPicker}
+        onFairCurveChange={id => updateConfig({ fairCurveOverride: id })}
       />
       {showGreekPicker && (
         <GreekPicker
@@ -602,13 +639,14 @@ function QuickPricer({ instanceId, config, onConfigChange }: WidgetProps<QuickPr
 // ─────────────────────────────────────────────────────────────────────────────
 
 function Toolbar({
-  config, onUpdate, onClear, onToggleGreekPicker, greekPickerOpen,
+  config, onUpdate, onClear, onToggleGreekPicker, greekPickerOpen, onFairCurveChange,
 }: {
   config: QuickPricerConfig;
   onUpdate: (p: Partial<QuickPricerConfig>) => void;
   onClear: () => void;
   onToggleGreekPicker: () => void;
   greekPickerOpen: boolean;
+  onFairCurveChange: (id: string | null) => void;
 }) {
   return (
     <div style={{
@@ -616,6 +654,11 @@ function Toolbar({
       padding: '4px 10px', borderBottom: '1px solid var(--border)',
       background: 'var(--bg-1)', flexShrink: 0, height: 28,
     }}>
+      <OverrideModelPicker
+        value={config.fairCurveOverride}
+        onChange={onFairCurveChange}
+        title="Fair-value model used for interpolated mode + greeks. Default follows the app-wide model in the header."
+      />
       <label style={chk}>
         <input
           type="checkbox"
@@ -1192,9 +1235,9 @@ registerWidget<QuickPricerConfig>({
   defaultConfig: DEFAULT_CONFIG,
   // v1 → initial Quick Pricer (legs/mode/perUnit). v2 → `taker` toggle plus
   // LIVE bps column and dollar-greek relabelling. v3 → user-selectable greek
-  // columns (8 variants, base + dollar for each greek). Migration preserves
-  // any saved legs and toggles; missing fields fall back to safe defaults.
-  configVersion: 3,
+  // columns (8 variants, base + dollar for each greek). v4 → per-widget
+  // `fairCurveOverride` (null = follow the app-wide default).
+  configVersion: 4,
   migrate: (_fromVersion, oldConfig) => {
     if (!oldConfig || typeof oldConfig !== 'object') return DEFAULT_CONFIG;
     const o = oldConfig as Partial<QuickPricerConfig>;
@@ -1204,6 +1247,7 @@ registerWidget<QuickPricerConfig>({
       perUnit: !!o.perUnit,
       taker: !!o.taker,
       greekColumns: o.greekColumns ? sanitizeGreekColumns(o.greekColumns) : [...DEFAULT_GREEK_COLS],
+      fairCurveOverride: typeof o.fairCurveOverride === 'string' ? o.fairCurveOverride : null,
     };
   },
   accentColor: ACCENT,
