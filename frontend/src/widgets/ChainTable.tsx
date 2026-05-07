@@ -66,6 +66,11 @@ interface ChainTableConfig {
   // — cool means the chain is bid above model fair (rich vs model on the
   // mark price), warm means cheap. Off by default.
   strikeShadeByModel: boolean;
+  // Tint bid/$bid/ask/$ask price cells when there is a positive tradeable
+  // edge vs theo: bid above theo → red intensity by edge size; ask below
+  // theo → blue intensity. EV/$EV cells follow the same logic regardless
+  // of this flag — those columns *are* the edge readout.
+  tintByEdge: boolean;
 }
 
 // Default puts-side order, spine-out: BID, MARK, ASK, IV, $BID, $MARK, $ASK, Δ24h, OI.
@@ -84,6 +89,7 @@ const DEFAULT_CONFIG: ChainTableConfig = {
   density: 'default',
   fairCurveOverride: null,
   strikeShadeByModel: false,
+  tintByEdge: true,
 };
 
 const ROW_HEIGHT: Record<RowDensity, number> = { compact: 18, default: 22, comfortable: 28 };
@@ -377,6 +383,13 @@ const MODEL_DEPENDENT_METRICS: Set<MetricId> = new Set([
   'model_iv', 'iv_resid', 'usd_resid', 'bps_resid',
 ]);
 
+// Bid/ask price metrics that the `tintByEdge` toggle paints. EV columns
+// (`bps_resid`, `usd_resid`) tint regardless of the toggle but are already
+// in MODEL_DEPENDENT_METRICS, so they don't need to be repeated here.
+const EDGE_TINTABLE_METRICS: Set<MetricId> = new Set([
+  'bid', 'ask', 'usd_bid', 'usd_ask',
+]);
+
 const FONT_SIZE: Record<'primary' | 'secondary' | 'tertiary', number> = {
   primary: 12, secondary: 11, tertiary: 10,
 };
@@ -412,11 +425,20 @@ type AugmentedChainRow = ChainRow & {
   iv_resid: number | null;       // mark_iv − model_iv (decimal vol points, signed)
   usd_resid: number | null;      // mark premium $ − model premium $
   bps_resid: number | null;      // (mark − model)/F · 1e4
+  // Tradeable-edge residuals in bps of forward, positive when the side has
+  // an edge: bid_edge > 0 means bid above theo (sell rich), ask_edge > 0
+  // means ask below theo (buy cheap). At most one is positive at a time
+  // since bid ≤ ask.
+  bid_edge_bps: number | null;
+  ask_edge_bps: number | null;
 };
 
 function augmentRowsWithModel(rows: ChainRow[], fit: SmileFit | null): AugmentedChainRow[] {
   if (!fit || rows.length === 0) {
-    return rows.map(r => ({ ...r, model_iv: null, iv_resid: null, usd_resid: null, bps_resid: null }));
+    return rows.map(r => ({
+      ...r, model_iv: null, iv_resid: null, usd_resid: null, bps_resid: null,
+      bid_edge_bps: null, ask_edge_bps: null,
+    }));
   }
   // Single evaluator call per chain — strikes flow through as an array so
   // SVI / SABR / future kinds share the loop. The eval runs at the fit's own
@@ -432,7 +454,10 @@ function augmentRowsWithModel(rows: ChainRow[], fit: SmileFit | null): Augmented
       ? ivBasis * basisToCal
       : null;
     if (modelIv == null || modelIv <= 0 || r.mark_iv == null || !Number.isFinite(r.mark_iv)) {
-      return { ...r, model_iv: modelIv, iv_resid: null, usd_resid: null, bps_resid: null };
+      return {
+        ...r, model_iv: modelIv, iv_resid: null, usd_resid: null, bps_resid: null,
+        bid_edge_bps: null, ask_edge_bps: null,
+      };
     }
     const ivResid = r.mark_iv - modelIv;
     // Premium residual: market mark_price was implied by Deribit under cal-T,
@@ -442,12 +467,26 @@ function augmentRowsWithModel(rows: ChainRow[], fit: SmileFit | null): Augmented
     const priced = priceBlack76(cp, fit.forward, r.strike, tCal, modelIv, 0);
     let usdResid: number | null = null;
     let bpsResid: number | null = null;
-    if (priced && r.mark_price != null && Number.isFinite(r.mark_price) && r.underlying_price > 0) {
-      const markUsd = r.mark_price * r.underlying_price;
-      usdResid = markUsd - priced.premium_fwd;
-      bpsResid = (r.mark_price - priced.premium_fwd / r.underlying_price) * 10000;
+    let bidEdgeBps: number | null = null;
+    let askEdgeBps: number | null = null;
+    if (priced && r.underlying_price > 0) {
+      const modelCoin = priced.premium_fwd / r.underlying_price;
+      if (r.mark_price != null && Number.isFinite(r.mark_price)) {
+        const markUsd = r.mark_price * r.underlying_price;
+        usdResid = markUsd - priced.premium_fwd;
+        bpsResid = (r.mark_price - modelCoin) * 10000;
+      }
+      if (r.bid_price != null && Number.isFinite(r.bid_price)) {
+        bidEdgeBps = (r.bid_price - modelCoin) * 10000;
+      }
+      if (r.ask_price != null && Number.isFinite(r.ask_price)) {
+        askEdgeBps = (modelCoin - r.ask_price) * 10000;
+      }
     }
-    return { ...r, model_iv: modelIv, iv_resid: ivResid, usd_resid: usdResid, bps_resid: bpsResid };
+    return {
+      ...r, model_iv: modelIv, iv_resid: ivResid, usd_resid: usdResid, bps_resid: bpsResid,
+      bid_edge_bps: bidEdgeBps, ask_edge_bps: askEdgeBps,
+    };
   });
 }
 
@@ -539,15 +578,19 @@ function ChainTable({ config, onConfigChange }: WidgetProps<ChainTableConfig>) {
   }, [config.symbol, config.expiry]);
 
   // Smile fit subscription — only when the user has the strike-shading toggle
-  // on or has at least one model-dependent column visible. Gated on catalog
-  // load so we don't subscribe with `ts=null` and then re-subscribe with the
-  // real ts a tick later (alpha-from-ts methodologies need the curve id at
-  // first call, otherwise the backend gets a malformed request). The oracle's
-  // refcount-shared key means the live sub is shared with any open SmileChart
-  // on the same (currency, expiry, methodology, ts).
+  // on, the edge-tint toggle on AND at least one bid/ask price column visible
+  // (no point fitting a smile when there's no cell to tint), or at least one
+  // model-dependent column visible. Gated on catalog load so we don't
+  // subscribe with `ts=null` and then re-subscribe with the real ts a tick
+  // later (alpha-from-ts methodologies need the curve id at first call,
+  // otherwise the backend gets a malformed request). The oracle's refcount-
+  // shared key means the live sub is shared with any open SmileChart on the
+  // same (currency, expiry, methodology, ts).
   const needSmile = useMemo(
-    () => config.strikeShadeByModel || config.metrics.some(m => MODEL_DEPENDENT_METRICS.has(m)),
-    [config.strikeShadeByModel, config.metrics],
+    () => config.strikeShadeByModel
+      || (config.tintByEdge && config.metrics.some(m => EDGE_TINTABLE_METRICS.has(m)))
+      || config.metrics.some(m => MODEL_DEPENDENT_METRICS.has(m)),
+    [config.strikeShadeByModel, config.tintByEdge, config.metrics],
   );
   const catalogReady = methodologyCatalog.length > 0;
   useEffect(() => {
@@ -666,6 +709,7 @@ function ChainTable({ config, onConfigChange }: WidgetProps<ChainTableConfig>) {
           accent={accent}
           pricerOpen={pricerOpen}
           strikeShadeByModel={config.strikeShadeByModel}
+          tintByEdge={config.tintByEdge}
           shadeMaxAlpha={shadeMaxAlpha}
         />
       )}
@@ -732,6 +776,17 @@ function Toolbar({ config, onConfigChange, expiries, forward, ts, onToggleColumn
           onChange={e => onConfigChange({ ...config, strikeShadeByModel: e.target.checked })}
         />
         <span style={{ fontSize: 11 }}>shade K</span>
+      </label>
+      <label
+        style={{ display: 'inline-flex', alignItems: 'center', gap: 4, cursor: 'pointer', userSelect: 'none', color: 'var(--fg-dim)' }}
+        title="Tint bid/ask price cells when there's a tradeable edge vs theo. Red = bid above theo (sell rich), blue = ask below theo (buy cheap). Intensity scales with edge size in bps of forward. EV columns ($EV / EVbps) always tint by the same edge logic regardless of this toggle — note their numeric value is mark vs theo and may be the opposite sign of the tinted side when both bid and ask straddle theo."
+      >
+        <input
+          type="checkbox"
+          checked={config.tintByEdge}
+          onChange={e => onConfigChange({ ...config, tintByEdge: e.target.checked })}
+        />
+        <span style={{ fontSize: 11 }}>tint edge</span>
       </label>
       <div style={{ flex: 1 }} />
       {forward != null && (
@@ -841,10 +896,11 @@ interface MirrorProps {
   accent: string;
   pricerOpen: boolean;
   strikeShadeByModel: boolean;
+  tintByEdge: boolean;
   shadeMaxAlpha: number;
 }
 
-function Mirror({ rows, metrics, forward, spotIdx, rowH, accent, pricerOpen, strikeShadeByModel, shadeMaxAlpha }: MirrorProps) {
+function Mirror({ rows, metrics, forward, spotIdx, rowH, accent, pricerOpen, strikeShadeByModel, tintByEdge, shadeMaxAlpha }: MirrorProps) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportH, setViewportH] = useState(0);
@@ -918,6 +974,7 @@ function Mirror({ rows, metrics, forward, spotIdx, rowH, accent, pricerOpen, str
                   isAtm={spotIdx >= 0 && (idx === spotIdx - 1 || idx === spotIdx)}
                   pricerOpen={pricerOpen}
                   strikeShadeByModel={strikeShadeByModel}
+                  tintByEdge={tintByEdge}
                   shadeMaxAlpha={shadeMaxAlpha}
                 />
               );
@@ -990,10 +1047,11 @@ interface RowProps {
   isAtm: boolean;
   pricerOpen: boolean;
   strikeShadeByModel: boolean;
+  tintByEdge: boolean;
   shadeMaxAlpha: number;
 }
 
-function Row({ pair, callMetrics, putMetrics, forward, rowH, isAtm, pricerOpen, strikeShadeByModel, shadeMaxAlpha }: RowProps) {
+function Row({ pair, callMetrics, putMetrics, forward, rowH, isAtm, pricerOpen, strikeShadeByModel, tintByEdge, shadeMaxAlpha }: RowProps) {
   const callItm = forward != null && pair.strike < forward;
   const putItm = forward != null && pair.strike > forward;
 
@@ -1016,6 +1074,7 @@ function Row({ pair, callMetrics, putMetrics, forward, rowH, isAtm, pricerOpen, 
         <Cell
           key={`c-${m.id}`} m={m} row={pair.call} itm={callItm}
           side="call" pricerOpen={pricerOpen}
+          tintByEdge={tintByEdge} shadeMaxAlpha={shadeMaxAlpha}
         />
       ))}
       <StrikeCell strike={pair.strike} isAtm={isAtm} ivResid={ivResid} shadeMaxAlpha={shadeMaxAlpha} />
@@ -1023,6 +1082,7 @@ function Row({ pair, callMetrics, putMetrics, forward, rowH, isAtm, pricerOpen, 
         <Cell
           key={`p-${m.id}`} m={m} row={pair.put} itm={putItm}
           side="put" pricerOpen={pricerOpen}
+          tintByEdge={tintByEdge} shadeMaxAlpha={shadeMaxAlpha}
         />
       ))}
     </div>
@@ -1034,6 +1094,27 @@ function pickIvResid(pair: PairedRow): number | null {
   const p = pair.put?.iv_resid;
   if (c != null && p != null) return (c + p) / 2;
   return c ?? p ?? null;
+}
+
+// Edge-tint tunables. Floor at `EDGE_MIN_FRAC` of maxAlpha so small-but-real
+// edges don't fade out — tradeable edges are usually ≤ a handful of bps, so
+// a pure linear ramp would leave them barely visible.
+const EDGE_DEAD_ZONE_BPS = 0.5;
+const EDGE_SAT_BPS = 15;
+const EDGE_MIN_FRAC = 0.32;
+
+// Cell tint for tradeable edge vs theo. `edgeBps` is positive when the side
+// has a real edge (bid above theo / ask below theo); ≤0 returns null. The
+// alpha ramp pins a minimum visible intensity once we cross the dead-zone,
+// then climbs to maxAlpha at saturation. Uses `--bid` / `--ask` tokens via
+// color-mix so the colors stay theme-locked.
+function edgeTintFor(edgeBps: number | null, side: 'bid' | 'ask', maxAlpha: number): string | null {
+  if (edgeBps == null || !Number.isFinite(edgeBps) || edgeBps <= EDGE_DEAD_ZONE_BPS) return null;
+  const t = Math.min(1, edgeBps / EDGE_SAT_BPS);
+  const alpha = maxAlpha * (EDGE_MIN_FRAC + (1 - EDGE_MIN_FRAC) * t);
+  const pct = (alpha * 100).toFixed(1);
+  const token = side === 'bid' ? 'var(--bid)' : 'var(--ask)';
+  return `color-mix(in oklab, ${token} ${pct}%, transparent)`;
 }
 
 // Diverging strike-shading. |resid| clamps at 2 vol points (0.02) for the
@@ -1117,6 +1198,21 @@ interface CellProps {
   itm: boolean;
   side: 'call' | 'put';
   pricerOpen: boolean;
+  tintByEdge: boolean;
+  shadeMaxAlpha: number;
+}
+
+// Which side's edge (if any) drives this metric's cell tint. EV columns are
+// always tinted by whichever edge is currently positive (rich → bid, cheap →
+// ask). Bid/ask price cells tint to their own side and only when `tintByEdge`
+// is on. Anything else returns null → no tint.
+function edgeMetricKind(m: MetricId): 'bid' | 'ask' | 'ev' | null {
+  switch (m) {
+    case 'bid': case 'usd_bid': return 'bid';
+    case 'ask': case 'usd_ask': return 'ask';
+    case 'bps_resid': case 'usd_resid': return 'ev';
+    default: return null;
+  }
 }
 
 // Map metric ids to leg action verbs. Both coin- and USD-denominated bid/ask
@@ -1130,10 +1226,26 @@ function legAction(metricId: MetricId): 1 | -1 | null {
   return null;
 }
 
-function Cell({ m, row, itm, side, pricerOpen }: CellProps) {
+function Cell({ m, row, itm, side, pricerOpen, tintByEdge, shadeMaxAlpha }: CellProps) {
   const ref = useRef<HTMLDivElement>(null);
   const prev = useRef<number | null>(null);
   const value = m.flashValue(row);
+
+  // Edge tint — composes on top of the ITM background. EV cells always tint
+  // (the column is the edge readout); bid/ask price cells gate on the user
+  // toggle. Pick the side whose edge is currently positive (at most one is).
+  const edgeKind = edgeMetricKind(m.id);
+  let edgeTint: string | null = null;
+  if (edgeKind && row) {
+    if (edgeKind === 'bid' && tintByEdge) {
+      edgeTint = edgeTintFor(row.bid_edge_bps, 'bid', shadeMaxAlpha);
+    } else if (edgeKind === 'ask' && tintByEdge) {
+      edgeTint = edgeTintFor(row.ask_edge_bps, 'ask', shadeMaxAlpha);
+    } else if (edgeKind === 'ev') {
+      edgeTint = edgeTintFor(row.bid_edge_bps, 'bid', shadeMaxAlpha)
+        ?? edgeTintFor(row.ask_edge_bps, 'ask', shadeMaxAlpha);
+    }
+  }
 
   useEffect(() => {
     const el = ref.current;
@@ -1176,6 +1288,15 @@ function Cell({ m, row, itm, side, pricerOpen }: CellProps) {
   const buttonOnLeft = action === +1;
   const buttonOnRight = action === -1;
 
+  // Layer edge tint on top of ITM. CSS `background` stacks gradients front-
+  // to-back, so the tint goes first. Plain ITM/no-tint stays as a single
+  // value to avoid an unnecessary gradient layer.
+  const bg = edgeTint
+    ? (itm
+      ? `linear-gradient(${edgeTint}, ${edgeTint}), var(--itm)`
+      : `linear-gradient(${edgeTint}, ${edgeTint})`)
+    : (itm ? 'var(--itm)' : undefined);
+
   return (
     <div
       ref={ref}
@@ -1185,7 +1306,7 @@ function Cell({ m, row, itm, side, pricerOpen }: CellProps) {
         paddingRight: buttonOnRight ? 18 : 6,
         textAlign: 'right',
         fontSize: FONT_SIZE[m.level],
-        background: itm ? 'var(--itm)' : undefined,
+        background: bg,
         whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
         position: 'relative',
       }}
@@ -1297,12 +1418,14 @@ registerWidget<ChainTableConfig>({
   title: 'Chain',
   component: ChainTable,
   defaultConfig: DEFAULT_CONFIG,
-  configVersion: 4,
+  configVersion: 5,
   // v1 → flat per-strike-rows-of-C/P columns; v2 → mirrored geometry; v3 → adds
   // $-denominated bid/ask/mark metrics (and a chronological dropdown sort, but
   // that's not a config concern); v4 → per-widget `fairCurveOverride` (null =
   // follow the app-wide model) + `strikeShadeByModel` toggle + 4 new mark-to-
-  // model metric columns (`model_iv`, `iv_resid`, `usd_resid`, `bps_resid`).
+  // model metric columns (`model_iv`, `iv_resid`, `usd_resid`, `bps_resid`);
+  // v5 → `tintByEdge` toggle for red/blue bid-ask edge tinting on price cells
+  // (EV cells follow the same tint logic regardless of the toggle).
   // Migrations preserve the user's existing metric choices and density, only
   // injecting the v3 USD trio if absent.
   migrate: (fromVersion, oldConfig) => {
@@ -1344,6 +1467,7 @@ registerWidget<ChainTableConfig>({
       density: o.density ?? 'default',
       fairCurveOverride: typeof o.fairCurveOverride === 'string' ? o.fairCurveOverride : null,
       strikeShadeByModel: !!o.strikeShadeByModel,
+      tintByEdge: typeof o.tintByEdge === 'boolean' ? o.tintByEdge : true,
     };
   },
   accentColor: DEFAULT_BTC_ACCENT,

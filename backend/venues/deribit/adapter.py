@@ -260,7 +260,13 @@ class DeribitAdapter(VenueAdapter):
             if (bid_iv is None or ask_iv is None) and mark.mark_iv > 0:
                 ex_ms = expiry_ms(inst_expiry)
                 if ex_ms is not None:
-                    t_years = vol_yte(ex_ms, mark.timestamp_ms, get_active_calendar())
+                    # Calendar-time, NOT vol_yte: Deribit publishes mark_iv at
+                    # cal time, so inverting bid/ask at the same basis keeps
+                    # all three on the same footing (any vol_yte→cal mismatch
+                    # would lift inverted IVs by ~√(cal/vol), so bid/ask IV
+                    # both end up above mark IV even when the prices bracket
+                    # the mark — see chart with blue/orange dots above white).
+                    t_years = cal_yte(ex_ms, mark.timestamp_ms)
                     is_call = (opt_type == "C")
                     if bid_iv is None and bid is not None and bid > 0:
                         bid_iv = iv_from_price(
