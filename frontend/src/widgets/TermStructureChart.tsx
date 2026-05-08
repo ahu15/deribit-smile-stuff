@@ -31,6 +31,7 @@ interface TermStructureChartConfig {
   showCurve: boolean;
   showMarkers: boolean;
   showHistoric: boolean;
+  showHistoricMarks: boolean;
   // M3.9 — overlay last N hourly-bucket TS curves behind live, color-faded
   // by age. 0 = off; bounded at 24 (HistoryStore cap).
   historyOverlayHours: number;
@@ -50,9 +51,10 @@ const DEFAULT_CONFIG: TermStructureChartConfig = {
   showCurve: true,
   showMarkers: true,
   showHistoric: false,
+  showHistoricMarks: true,
   historyOverlayHours: 0,
   compareMethods: [],
-  configVersion: 3,
+  configVersion: 4,
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -445,7 +447,7 @@ function SettingsPanel({
     onConfigChange({ ...config, compareMethods: next });
   };
   const Toggle = (
-    key: 'showCurve' | 'showMarkers' | 'showHistoric',
+    key: 'showCurve' | 'showMarkers' | 'showHistoric' | 'showHistoricMarks',
     label: string,
   ) => (
     <label key={key} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, cursor: 'pointer', userSelect: 'none' }}>
@@ -469,6 +471,7 @@ function SettingsPanel({
       <span style={{ width: 1, height: 14, background: 'var(--bg-2)', margin: '0 4px' }} />
       <span style={{ color: 'var(--fg-mute)', fontSize: 10, letterSpacing: '0.10em' }}>HISTORIC</span>
       {Toggle('showHistoric', 'overlay')}
+      {Toggle('showHistoricMarks', 'marks')}
       <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
         <span style={{ color: 'var(--fg-mute)', fontSize: 10, letterSpacing: '0.10em' }}>AS OF</span>
         <input
@@ -591,6 +594,13 @@ interface PlotProps {
 
 const PAD = { top: 12, right: 16, bottom: 28, left: 56 };
 
+// Long-end of the curve (≥ ~1.25y) is essentially DMR's parametric tail with
+// no market anchors at typical Deribit chains — clip the visible window so
+// the front, where the action lives, isn't squeezed into a third of the plot.
+// Applied uniformly across cal/wkg axes; the stored snapshot still contains
+// the full grid so methodology consumers see the full tenor range.
+const X_CAP_YEARS = 1.25;
+
 function Plot({ env, historic, historyBuckets, compareEnvs, methods, accent, config }: PlotProps) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
@@ -618,43 +628,53 @@ function Plot({ env, historic, historyBuckets, compareEnvs, methods, accent, con
     () => (snap ? pickMarket(snap, config.xAxis, config.yAxis) : null),
     [snap, config.xAxis, config.yAxis],
   );
+  const histMarket = useMemo(
+    () => (histSnap ? pickMarket(histSnap, config.xAxis, config.yAxis) : null),
+    [histSnap, config.xAxis, config.yAxis],
+  );
 
   const bounds = useMemo(() => {
     if (!snap) return null;
-    const xs: number[] = [...pickGrid(snap, config.xAxis)];
-    const ys: number[] = [...pickYGrid(snap, config.yAxis)];
-    if (config.showMarkers && market) {
-      xs.push(...market.xs);
-      ys.push(...market.ys);
-    }
+    // Y-range is derived from points within the visible x window so the y-axis
+    // tightens to what's actually drawn — same trick as SmileChart's xMin/xMax.
+    const inX = (x: number) => x <= X_CAP_YEARS;
+    const xs: number[] = [];
+    const ys: number[] = [];
+    const pushSeries = (xSeries: number[], ySeries: number[]) => {
+      for (let i = 0; i < xSeries.length; i++) {
+        if (!inX(xSeries[i])) continue;
+        xs.push(xSeries[i]);
+        ys.push(ySeries[i]);
+      }
+    };
+    pushSeries(pickGrid(snap, config.xAxis), pickYGrid(snap, config.yAxis));
+    if (config.showMarkers && market) pushSeries(market.xs, market.ys);
     if (histSnap) {
-      xs.push(...pickGrid(histSnap, config.xAxis));
-      ys.push(...pickYGrid(histSnap, config.yAxis));
+      pushSeries(pickGrid(histSnap, config.xAxis), pickYGrid(histSnap, config.yAxis));
+      if (config.showHistoricMarks && histMarket) pushSeries(histMarket.xs, histMarket.ys);
     }
     if (config.historyOverlayHours > 0) {
       // Skip head — already covered by the live curve.
       for (let h = 0; h < historyBuckets.length - 1; h++) {
         const s = historyBuckets[h].snapshot;
         if (!s) continue;
-        xs.push(...pickGrid(s, config.xAxis));
-        ys.push(...pickYGrid(s, config.yAxis));
+        pushSeries(pickGrid(s, config.xAxis), pickYGrid(s, config.yAxis));
       }
     }
     for (const id of config.compareMethods) {
       const ce = compareEnvs[id];
       if (!ce?.snapshot) continue;
-      xs.push(...pickGrid(ce.snapshot, config.xAxis));
-      ys.push(...pickYGrid(ce.snapshot, config.yAxis));
+      pushSeries(pickGrid(ce.snapshot, config.xAxis), pickYGrid(ce.snapshot, config.yAxis));
     }
     if (xs.length === 0 || ys.length === 0) return null;
     const xmin = Math.min(...xs);
-    const xmax = Math.max(...xs);
+    const xmax = Math.min(Math.max(...xs), X_CAP_YEARS);
     const ymin = Math.min(...ys);
     const ymax = Math.max(...ys);
     if (!Number.isFinite(xmin) || !Number.isFinite(xmax) || xmin >= xmax) return null;
     const yPad = (ymax - ymin) * 0.1 || 0.01;
     return { xmin, xmax, ymin: Math.max(0, ymin - yPad), ymax: ymax + yPad };
-  }, [snap, histSnap, historyBuckets, compareEnvs, market, config.xAxis, config.yAxis, config.showMarkers, config.historyOverlayHours, config.compareMethods]);
+  }, [snap, histSnap, historyBuckets, compareEnvs, market, histMarket, config.xAxis, config.yAxis, config.showMarkers, config.showHistoricMarks, config.historyOverlayHours, config.compareMethods]);
 
   const sx = (x: number) => bounds == null
     ? 0
@@ -663,26 +683,29 @@ function Plot({ env, historic, historyBuckets, compareEnvs, methods, accent, con
     ? 0
     : PAD.top + (1 - (y - bounds.ymin) / (bounds.ymax - bounds.ymin || 1)) * innerH;
 
-  const path = useMemo(() => {
-    if (!snap || !bounds) return '';
-    const xs = pickGrid(snap, config.xAxis);
-    const ys = pickYGrid(snap, config.yAxis);
+  // All path generators clip to bounds.xmax (the visible cap) so the cropped
+  // long-end doesn't paint outside the axis. Grid is monotone in x so a
+  // simple early-break is sufficient — no need to break + restart subpaths.
+  const buildPath = (xs: number[], ys: number[]): string => {
+    if (!bounds) return '';
     let d = '';
+    let started = false;
     for (let i = 0; i < xs.length; i++) {
-      d += `${i === 0 ? 'M' : 'L'}${sx(xs[i]).toFixed(2)},${sy(ys[i]).toFixed(2)} `;
+      if (xs[i] > bounds.xmax) break;
+      d += `${started ? 'L' : 'M'}${sx(xs[i]).toFixed(2)},${sy(ys[i]).toFixed(2)} `;
+      started = true;
     }
     return d;
+  };
+
+  const path = useMemo(() => {
+    if (!snap || !bounds) return '';
+    return buildPath(pickGrid(snap, config.xAxis), pickYGrid(snap, config.yAxis));
   }, [snap, bounds, config.xAxis, config.yAxis]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const histPath = useMemo(() => {
     if (!histSnap || !bounds) return '';
-    const xs = pickGrid(histSnap, config.xAxis);
-    const ys = pickYGrid(histSnap, config.yAxis);
-    let d = '';
-    for (let i = 0; i < xs.length; i++) {
-      d += `${i === 0 ? 'M' : 'L'}${sx(xs[i]).toFixed(2)},${sy(ys[i]).toFixed(2)} `;
-    }
-    return d;
+    return buildPath(pickGrid(histSnap, config.xAxis), pickYGrid(histSnap, config.yAxis));
   }, [histSnap, bounds, config.xAxis, config.yAxis]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Hourly-bucket overlay paths — drop the head (visually identical to the
@@ -694,12 +717,7 @@ function Plot({ env, historic, historyBuckets, compareEnvs, methods, accent, con
     if (trimmed.length === 0) return [];
     return trimmed.map((b, i, arr) => {
       const s = b.snapshot as TermStructureSnapshot;
-      const xs = pickGrid(s, config.xAxis);
-      const ys = pickYGrid(s, config.yAxis);
-      let d = '';
-      for (let j = 0; j < xs.length; j++) {
-        d += `${j === 0 ? 'M' : 'L'}${sx(xs[j]).toFixed(2)},${sy(ys[j]).toFixed(2)} `;
-      }
+      const d = buildPath(pickGrid(s, config.xAxis), pickYGrid(s, config.yAxis));
       const t = arr.length === 1 ? 0.5 : i / (arr.length - 1);
       const opacity = 0.15 + 0.50 * t;
       return { d, opacity, bucket_ts: b.bucket_ts };
@@ -718,12 +736,7 @@ function Plot({ env, historic, historyBuckets, compareEnvs, methods, accent, con
       const ce = compareEnvs[id];
       const s = ce?.snapshot;
       if (!s) return null;
-      const xs = pickGrid(s, config.xAxis);
-      const ys = pickYGrid(s, config.yAxis);
-      let d = '';
-      for (let j = 0; j < xs.length; j++) {
-        d += `${j === 0 ? 'M' : 'L'}${sx(xs[j]).toFixed(2)},${sy(ys[j]).toFixed(2)} `;
-      }
+      const d = buildPath(pickGrid(s, config.xAxis), pickYGrid(s, config.yAxis));
       const label = methods.find(m => m.id === id)?.label ?? id;
       return { id, d, color: COMPARE_PALETTE[i % COMPARE_PALETTE.length], label };
     }).filter((x): x is { id: string; d: string; color: string; label: string } => x !== null);
@@ -826,6 +839,7 @@ function Plot({ env, historic, historyBuckets, compareEnvs, methods, accent, con
             </g>
           )}
           {config.showMarkers && market && market.xs.map((x, i) => {
+            if (x > bounds.xmax) return null;
             const expiryMs = snapTsMs != null
               ? snapTsMs + snap.market_t_cal[i] * YEAR_MS
               : null;
@@ -848,12 +862,33 @@ function Plot({ env, historic, historyBuckets, compareEnvs, methods, accent, con
               </circle>
             );
           })}
+          {/* Historic market dots — dimmer hollow rings to read as
+              "frozen reference" against the live solid markers. */}
+          {config.showHistoric && config.showHistoricMarks && histSnap && histMarket
+            && histMarket.xs.map((x, i) => {
+              if (x > bounds.xmax) return null;
+              const ex = histMarket.labels[i] ?? '';
+              return (
+                <circle
+                  key={`hm-${i}`}
+                  cx={sx(x)} cy={sy(histMarket.ys[i])}
+                  r={2.5} fill="none"
+                  stroke="var(--fg-dim)" strokeWidth={1}
+                >
+                  <title>{`${ex} · historic\n` +
+                    `t_cal=${histSnap.market_t_cal[i].toFixed(4)}y  ` +
+                    `t_wkg=${histSnap.market_t_wkg[i].toFixed(4)}y\n` +
+                    `${Y_LABELS[config.yAxis]}=${formatY(histMarket.ys[i], config.yAxis)}`}</title>
+                </circle>
+              );
+            })}
           <HoverOverlay
             cursorX={cursorX}
             snap={snap}
             snapTsMs={snapTsMs}
             config={config}
             sx={sx} sy={sy}
+            dataXMax={bounds.xmax}
             xMax={size.w - PAD.right}
             yTop={PAD.top}
             yBot={size.h - PAD.bottom}
@@ -872,6 +907,7 @@ interface HoverOverlayProps {
   config: TermStructureChartConfig;
   sx: (x: number) => number;
   sy: (y: number) => number;
+  dataXMax: number;
   xMax: number;
   yTop: number;
   yBot: number;
@@ -879,19 +915,22 @@ interface HoverOverlayProps {
 }
 
 function HoverOverlay({
-  cursorX, snap, snapTsMs, config, sx, sy, xMax, yTop, yBot, accent,
+  cursorX, snap, snapTsMs, config, sx, sy, dataXMax, xMax, yTop, yBot, accent,
 }: HoverOverlayProps) {
   if (cursorX == null) return null;
   const xs = pickGrid(snap, config.xAxis);
   const ys = pickYGrid(snap, config.yAxis);
   if (xs.length === 0) return null;
-  // Nearest grid index by screen x
-  let bestI = 0;
+  // Nearest grid index by screen x — restrict to the visible window so a
+  // clipped long-end point can't win when hovering near the right edge.
+  let bestI = -1;
   let bestDx = Infinity;
   for (let i = 0; i < xs.length; i++) {
+    if (xs[i] > dataXMax) break;
     const dx = Math.abs(sx(xs[i]) - cursorX);
     if (dx < bestDx) { bestDx = dx; bestI = i; }
   }
+  if (bestI < 0) return null;
   const tCal = snap.t_years_cal_grid[bestI];
   const tWkg = snap.t_years_wkg_grid[bestI];
   const xPx = sx(xs[bestI]);
@@ -960,6 +999,8 @@ const btnStyle: React.CSSProperties = {
 // → ts_atm_dmr_*) and drop volvol_grid/atm-curve picker noise; also adds
 // `historyOverlayHours` (M3.9, default off — backwards compatible).
 // v3 → adds `compareMethods` (M3.9, default empty).
+// v4 → adds `showHistoricMarks` (default true) so historic-overlay dots
+// match SmileChart's behavior; previous saved profiles get the toggle on.
 const CURVE_METHOD_RENAMES: Record<string, string> = {
   'ts_alpha_dmr_cal': 'ts_atm_dmr_cal',
   'ts_alpha_dmr_wkg': 'ts_atm_dmr_wkg',
@@ -973,7 +1014,7 @@ registerWidget<TermStructureChartConfig>({
   formatTitle: c => c?.symbol ? `Term Structure ${c.symbol}` : 'Term Structure',
   component: TermStructureChart,
   defaultConfig: DEFAULT_CONFIG,
-  configVersion: 3,
+  configVersion: 4,
   migrate: (_fromVersion, oldConfig) => {
     if (!oldConfig || typeof oldConfig !== 'object') return DEFAULT_CONFIG;
     const o = oldConfig as Partial<TermStructureChartConfig>;
@@ -984,7 +1025,10 @@ registerWidget<TermStructureChartConfig>({
     const compareMethods = Array.isArray(o.compareMethods)
       ? o.compareMethods.filter(x => typeof x === 'string').slice(0, COMPARE_CAP)
       : [];
-    return { ...DEFAULT_CONFIG, ...o, method, compareMethods };
+    const showHistoricMarks = typeof o.showHistoricMarks === 'boolean'
+      ? o.showHistoricMarks
+      : DEFAULT_CONFIG.showHistoricMarks;
+    return { ...DEFAULT_CONFIG, ...o, method, compareMethods, showHistoricMarks };
   },
   accentColor: DEFAULT_BTC_ACCENT,
 });

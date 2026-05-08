@@ -173,17 +173,48 @@ def _stamp_snapshot(
     calendar_rev: str,
     market_t_cal: list[float],
     market_t_wkg: list[float],
-    market_atm: list[float],
+    market_sigma_cal: list[float],
+    market_sigma_wkg: list[float],
     market_expiries: list[str],
 ) -> TermStructureSnapshot:
-    """Sample the DMR curve at the standard grid in both bases."""
+    """Sample the DMR curve at the standard grid in both bases.
+
+    The fit is always built in wkg-space (matches the reference SABR-DMR
+    utility — `fit_double_mean_reversion(yte_wkg, vol_wkg)`); cal-display
+    values are derived via the variance-preserving ratio
+    `σ_cal = σ_wkg · √(t_wkg/t_cal)`. `time_basis` only picks which display
+    basis is stamped into `atm_vol_grid` / `market_atm_vol`.
+    """
     t_cal_grid, t_wkg_grid = _build_grid(snap_ts_ms, calendar)
-    fit_grid = t_cal_grid if time_basis == "cal" else t_wkg_grid
-    fit_grid_arr = np.array(fit_grid, dtype=float)
-    atm_vol = fit.vol_at(fit_grid_arr)
-    fwd_var = fit.fwd_var_at(fit_grid_arr)
+    t_cal_grid_arr = np.array(t_cal_grid, dtype=float)
+    t_wkg_grid_arr = np.array(t_wkg_grid, dtype=float)
+
+    sigma_wkg_grid = fit.vol_at(t_wkg_grid_arr)
+    # σ_cal = σ_wkg · √(t_wkg / t_cal). Falls back to σ_wkg at the edge case
+    # t_cal = 0 (snap-day expiry) — no display value matters there anyway.
+    ratio = np.where(
+        t_cal_grid_arr > 0,
+        np.sqrt(t_wkg_grid_arr / np.where(t_cal_grid_arr > 0, t_cal_grid_arr, 1.0)),
+        1.0,
+    )
+    sigma_cal_grid = sigma_wkg_grid * ratio
+    fwd_var_grid = fit.fwd_var_at(t_wkg_grid_arr)
+
+    if time_basis == "wkg":
+        atm_vol_grid = sigma_wkg_grid
+        market_atm_display = market_sigma_wkg
+    else:
+        atm_vol_grid = sigma_cal_grid
+        market_atm_display = market_sigma_cal
+
+    # `alpha_grid` is consumed by `sabr_alpha_frozen` and must always be in
+    # cal-vol convention (SABR's σ in chain marks is cal-quoted) regardless
+    # of curve basis. The consumer pairs `alpha_grid[i]` with
+    # `t_years_<basis>_grid[i]`, so storing σ_cal at every grid index gives
+    # them σ_cal at the leg's date irrespective of basis.
+    alpha_grid = sigma_cal_grid
     fv_market, fv_t_cal, fv_t_wkg = _market_fwd_var(
-        time_basis, market_t_cal, market_t_wkg, market_atm,
+        time_basis, market_t_cal, market_t_wkg, market_atm_display,
     )
     return TermStructureSnapshot(
         method=method,
@@ -191,15 +222,15 @@ def _stamp_snapshot(
         time_basis=time_basis,
         t_years_cal_grid=t_cal_grid,
         t_years_wkg_grid=t_wkg_grid,
-        atm_vol_grid=[float(v) for v in atm_vol],
-        alpha_grid=[float(v) for v in atm_vol],   # β=1 ⇒ α ≈ ATM lognormal vol
-        fwd_var_grid=[float(v) for v in fwd_var],
+        atm_vol_grid=[float(v) for v in atm_vol_grid],
+        alpha_grid=[float(v) for v in alpha_grid],
+        fwd_var_grid=[float(v) for v in fwd_var_grid],
         params=dict(fit.params),
         rmse=fit.rmse,
         calendar_rev=calendar_rev,
         market_t_cal=market_t_cal,
         market_t_wkg=market_t_wkg,
-        market_atm_vol=market_atm,
+        market_atm_vol=list(market_atm_display),
         market_expiries=market_expiries,
         market_fwd_var=fv_market,
         market_fwd_var_t_cal=fv_t_cal,
@@ -237,6 +268,16 @@ def _build_dmr_snapshot(
     builder: CurveBuilder, ctx: BuildContext,
     per_expiry: list[tuple[str, float]], calendar,
 ) -> TermStructureSnapshot | None:
+    """Fit DMR in wkg-space on σ_wkg per the reference SABR-DMR utility.
+
+    The reference always works in (yte_wkg, vol_wkg) space — `vol_wkg = vol *
+    sqrt(yte/yte_wkg)` preserves total variance. Both `ts_atm_dmr_cal` and
+    `ts_atm_dmr_wkg` builders share this single fit and only differ in which
+    display basis (`σ_cal` vs `σ_wkg`) ends up in the snapshot's
+    `atm_vol_grid` / `market_atm_vol`. Previously each builder fit in its own
+    basis on raw `σ_cal`, which violated the variance-preserving convention
+    and produced a poor wkg fit (rmse ~6.9% vs cal's 2.3%).
+    """
     if len(per_expiry) < 5:
         log.debug(
             "%s/%s: need ≥5 expiries to fit DMR, got %d",
@@ -244,37 +285,31 @@ def _build_dmr_snapshot(
         )
         return None
 
-    t_by_expiry = (
-        ctx.t_years_wkg_by_expiry if builder.time_basis == "wkg"
-        else ctx.t_years_cal_by_expiry
-    )
-    points: list[tuple[float, float, float, float, str]] = []  # (t_fit, atm, t_cal, t_wkg, ex)
-    for ex, atm in per_expiry:
+    points: list[tuple[float, float, float, float, str]] = []  # (t_cal, t_wkg, σ_cal, σ_wkg, ex)
+    for ex, sigma_cal in per_expiry:
         t_cal = ctx.t_years_cal_by_expiry.get(ex)
         t_wkg = ctx.t_years_wkg_by_expiry.get(ex)
-        if t_cal is None or t_wkg is None:
+        if t_cal is None or t_wkg is None or t_cal <= 0 or t_wkg <= 0:
             continue
-        t_fit = t_by_expiry.get(ex)
-        if t_fit is None or t_fit <= 0:
-            continue
-        points.append((t_fit, atm, t_cal, t_wkg, ex))
+        sigma_wkg = sigma_cal * float(np.sqrt(t_cal / t_wkg))
+        points.append((t_cal, t_wkg, sigma_cal, sigma_wkg, ex))
     if len(points) < 5:
         return None
-    points.sort(key=lambda p: p[0])
-    # De-dupe identical t_fit values (different expiries with the same wkg
-    # mapping under a degenerate calendar shouldn't break the fit).
+
+    # Sort by the fitting basis (t_wkg) and de-dupe identical wkg-times.
+    points.sort(key=lambda p: p[1])
     deduped: list[tuple[float, float, float, float, str]] = []
     for p in points:
-        if deduped and p[0] <= deduped[-1][0]:
+        if deduped and p[1] <= deduped[-1][1]:
             continue
         deduped.append(p)
     if len(deduped) < 5:
         return None
 
-    t_arr = np.array([p[0] for p in deduped], dtype=float)
-    v_arr = np.array([p[1] for p in deduped], dtype=float)
+    t_wkg_arr = np.array([p[1] for p in deduped], dtype=float)
+    sigma_wkg_arr = np.array([p[3] for p in deduped], dtype=float)
     try:
-        fit = fit_dmr(t_arr, v_arr, logger=log)
+        fit = fit_dmr(t_wkg_arr, sigma_wkg_arr, logger=log)
     except ValueError as exc:
         log.debug("%s/%s: fit_dmr rejected: %s", ctx.currency, builder.method, exc)
         return None
@@ -287,9 +322,10 @@ def _build_dmr_snapshot(
         snap_ts_ms=ctx.snapshot.timestamp_ms,
         calendar=calendar,
         calendar_rev=ctx.calendar_rev,
-        market_t_cal=[p[2] for p in deduped],
-        market_t_wkg=[p[3] for p in deduped],
-        market_atm=[p[1] for p in deduped],
+        market_t_cal=[p[0] for p in deduped],
+        market_t_wkg=[p[1] for p in deduped],
+        market_sigma_cal=[p[2] for p in deduped],
+        market_sigma_wkg=[p[3] for p in deduped],
         market_expiries=[p[4] for p in deduped],
     )
 

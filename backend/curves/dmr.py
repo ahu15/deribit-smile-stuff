@@ -75,7 +75,11 @@ def _build_bounds(
     """Box constraints + warm-start vector for the DMR fit.
 
     `v_fit` is the user-space vol grid (used for variance-domain bounds);
-    `y_fwd_var` is the forward-variance back-end the optimizer fits.
+    `y_fwd_var` is the forward-variance back-end the optimizer fits. λ ranges
+    match the reference SABR-DMR utility's `_build_dmr_bounds` (short
+    ∈ [0.1d, 20d], long ∈ [10d, 50d]); these slightly overlap but the warm
+    starts (λ_short from the SMR fit, λ_long at 30d) keep the solver in the
+    right basin.
     """
     vol_lo = max(v_fit.min() * 0.5, 0.01) ** 2
     vol_hi = (v_fit.max() * 2.0) ** 2
@@ -215,7 +219,7 @@ def fit_dmr(
     vols: np.ndarray,
     *,
     min_yte: float | None = None,
-    back_end_yte: float = 1 / 12,           # SMR back-end skips expiries shorter than this
+    back_end_yte: float | None = None,      # SMR back-end skips expiries shorter than this
     back_end_weight: float = 1.0,           # weight on errors at yte >= back_end_yte (1.0 = uniform)
     logger: logging.Logger | None = None,
 ) -> DmrFit:
@@ -223,11 +227,8 @@ def fit_dmr(
 
     Stage 1 fits SMR to the back end (yte ≥ back_end_yte) to anchor v_final
     and λ_short. Stage 2 fits the full DMR using those estimates as a warm
-    start.
-
-    `min_yte` filters short-dated points before fitting (default 1/d, where
-    d = TOTAL_WKG_D — drops ~today's expiry from the fit since its forward
-    variance is dominated by the t→0 limit and would distort the curve).
+    start. Defaults for `min_yte` (0.5/d) and `back_end_yte` (2/d) match the
+    reference SABR-DMR utility's `_dmr_fit_kwargs("vol")`.
     """
     log = logger or logging.getLogger(__name__)
 
@@ -245,7 +246,9 @@ def fit_dmr(
 
     d = TOTAL_WKG_D
     if min_yte is None:
-        min_yte = 1.0 / d
+        min_yte = 0.5 / d
+    if back_end_yte is None:
+        back_end_yte = 2.0 / d
 
     mask = t >= min_yte
     be_mask = t >= back_end_yte
