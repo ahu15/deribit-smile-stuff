@@ -1416,6 +1416,7 @@ const btnStyle: React.CSSProperties = {
 registerWidget<ChainTableConfig>({
   id: 'chainTable',
   title: 'Chain',
+  formatTitle: c => c?.expiry ? `Chain ${c.symbol} ${c.expiry.toLowerCase()}` : `Chain ${c?.symbol ?? ''}`.trim(),
   component: ChainTable,
   defaultConfig: DEFAULT_CONFIG,
   configVersion: 5,

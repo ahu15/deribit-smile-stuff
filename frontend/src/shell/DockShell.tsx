@@ -40,6 +40,15 @@ function migrate(spec: ReturnType<typeof getWidget>, fromVersion: number, oldCon
   return spec.migrate ? spec.migrate(fromVersion, oldConfig) : spec.defaultConfig;
 }
 
+// Resolve the tab title from the widget spec. Falls back to the static
+// `spec.title` if `formatTitle` isn't provided or throws on a stale shape.
+function panelTitle(spec: ReturnType<typeof getWidget>, config: unknown): string {
+  if (!spec) return '';
+  if (!spec.formatTitle) return spec.title;
+  try { return spec.formatTitle(config) || spec.title; }
+  catch { return spec.title; }
+}
+
 // ---------- panel wrapper ----------
 
 function WidgetPanel({ api, params }: IDockviewPanelProps<PanelParams>) {
@@ -64,6 +73,13 @@ function WidgetPanel({ api, params }: IDockviewPanelProps<PanelParams>) {
       configVersion: spec.configVersion,
     } satisfies PanelParams);
   }, [api, spec, stale, params.widgetId, params.configVersion, params.config]);
+
+  // Refresh the tab title whenever the config changes (e.g. switching expiry).
+  // setTitle is a no-op if the title hasn't actually changed, so this is cheap.
+  useEffect(() => {
+    if (!spec) return;
+    api.setTitle(panelTitle(spec, params.config));
+  }, [api, spec, params.config]);
 
   if (!spec) {
     return <div style={{ padding: 12, color: 'var(--fg-mute)', fontSize: 12 }}>Unknown widget: {params.widgetId}</div>;
@@ -132,7 +148,7 @@ function addShakedownPanel(api: DockviewApi) {
   api.addPanel({
     id: newPanelId(spec.id),
     component: 'widget',
-    title: spec.title,
+    title: panelTitle(spec, spec.defaultConfig),
     params: { widgetId: spec.id, config: spec.defaultConfig, configVersion: spec.configVersion },
   });
 }
@@ -179,7 +195,7 @@ export function DockShell() {
     api.addPanel({
       id: newPanelId(widgetId),
       component: 'widget',
-      title: spec.title,
+      title: panelTitle(spec, spec.defaultConfig),
       params: { widgetId, config: spec.defaultConfig, configVersion: spec.configVersion },
     });
   }, []);

@@ -1243,6 +1243,7 @@ const btnStyle: React.CSSProperties = {
 registerWidget<SmileChartConfig>({
   id: 'smileChart',
   title: 'Smile',
+  formatTitle: c => c?.expiry ? `Smile ${c.symbol} ${c.expiry.toLowerCase()}` : `Smile ${c?.symbol ?? ''}`.trim(),
   component: SmileChart,
   defaultConfig: DEFAULT_CONFIG,
   configVersion: 9,

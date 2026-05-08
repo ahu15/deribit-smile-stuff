@@ -970,6 +970,7 @@ const CURVE_METHOD_RENAMES: Record<string, string> = {
 registerWidget<TermStructureChartConfig>({
   id: 'termStructureChart',
   title: 'Term Structure',
+  formatTitle: c => c?.symbol ? `Term Structure ${c.symbol}` : 'Term Structure',
   component: TermStructureChart,
   defaultConfig: DEFAULT_CONFIG,
   configVersion: 3,

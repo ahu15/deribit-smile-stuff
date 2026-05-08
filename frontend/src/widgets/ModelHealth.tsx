@@ -185,6 +185,7 @@ const selectStyle: React.CSSProperties = {
 registerWidget<ModelHealthConfig>({
   id: 'modelHealth',
   title: 'Model Health',
+  formatTitle: c => c?.symbol ? `Model Health ${c.symbol}` : 'Model Health',
   component: ModelHealth,
   defaultConfig: DEFAULT_CONFIG,
   configVersion: 2,
